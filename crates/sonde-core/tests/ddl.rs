@@ -50,12 +50,14 @@ fn new_columns(kind: DbKind) -> Vec<NewColumn> {
             type_name: int.into(),
             nullable: false,
             primary_key: true,
+            default: None,
         },
         NewColumn {
             name: "name".into(),
             type_name: sonde_core::ddl::default_type(kind).into(),
             nullable: true,
             primary_key: false,
+            default: None,
         },
     ]
 }
@@ -112,6 +114,7 @@ fn table_round_trip(session: &dyn Session, kind: DbKind, schema: &str) {
                 type_name: sonde_core::ddl::default_type(kind).into(),
                 nullable: true,
                 primary_key: false,
+                default: None,
             },
         },
     );
@@ -401,4 +404,127 @@ fn database_lists_should_follow_creates_and_drops() {
         common::scalar(&*twelve, "GET listed"),
         sonde_core::Value::text("1")
     );
+}
+
+/// Make one table per type the chooser offers for `kind`, with the type's
+/// default arguments, and return the types the server refused.
+fn refused_types(session: &dyn Session, kind: DbKind, schema: &str) -> Vec<String> {
+    let mut refused = Vec::new();
+    for (ix, column_type) in sonde_core::ddl::column_types(kind).iter().enumerate() {
+        let spelled = column_type.spelled(column_type.args.unwrap_or(""));
+        let table = TableRef::new(schema, format!("sonde_type_{ix}"));
+        let _ = run(
+            session,
+            &statements(kind, &Change::DropTable(table.clone())).unwrap()[0],
+            &[],
+        );
+        let key = NewColumn {
+            name: "id".into(),
+            type_name: if kind == DbKind::Elasticsearch {
+                "long".into()
+            } else {
+                "int".into()
+            },
+            nullable: false,
+            primary_key: kind != DbKind::Elasticsearch,
+            default: None,
+        };
+        let column = NewColumn {
+            name: "c".into(),
+            type_name: spelled.clone(),
+            nullable: true,
+            primary_key: false,
+            default: None,
+        };
+        let create = Change::CreateTable {
+            table: table.clone(),
+            columns: vec![key, column],
+        };
+        let outcome = statements(kind, &create)
+            .map_err(sonde_core::Error::Config)
+            .and_then(|sql| {
+                sql.iter()
+                    .try_for_each(|sql| run(session, sql, &[]).map(|_| ()))
+            });
+        match outcome {
+            Ok(()) => {
+                let _ = run(
+                    session,
+                    &statements(kind, &Change::DropTable(table)).unwrap()[0],
+                    &[],
+                );
+            }
+            Err(error) => refused.push(format!("{spelled}: {error}")),
+        }
+    }
+    refused
+}
+
+#[test]
+fn every_offered_column_type_should_be_accepted_by_its_database() {
+    let mut refused: Vec<String> = Vec::new();
+    let mut check = |name: &str, list: Vec<String>| {
+        refused.extend(list.into_iter().map(|line| format!("{name} {line}")));
+    };
+
+    let pg = common::postgres();
+    setup(
+        &*pg,
+        &[
+            "DROP SCHEMA IF EXISTS sonde_types CASCADE",
+            "CREATE SCHEMA sonde_types",
+        ],
+    );
+    check(
+        "PostgreSQL",
+        refused_types(&*pg, DbKind::Postgres, "sonde_types"),
+    );
+    setup(&*pg, &["DROP SCHEMA sonde_types CASCADE"]);
+
+    for (kind, port) in [(DbKind::Mysql, 33069), (DbKind::Mariadb, 33070)] {
+        let session = open(&local(kind, port, "sonde", "sonde"), Some("sonde"));
+        setup(
+            &*session,
+            &[
+                "DROP DATABASE IF EXISTS sonde_types",
+                "CREATE DATABASE sonde_types",
+            ],
+        );
+        check(kind.name(), refused_types(&*session, kind, "sonde_types"));
+        setup(&*session, &["DROP DATABASE sonde_types"]);
+    }
+
+    let mssql = common::mssql();
+    check(
+        "SQL Server",
+        refused_types(&*mssql, DbKind::SqlServer, "dbo"),
+    );
+
+    check(
+        "SQLite",
+        refused_types(&*common::sqlite(), DbKind::Sqlite, "main"),
+    );
+
+    let cassandra = open(&local(DbKind::Cassandra, 19042, "", ""), None);
+    setup(
+        &*cassandra,
+        &[
+            "DROP KEYSPACE IF EXISTS sonde_types",
+            "CREATE KEYSPACE sonde_types WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}",
+        ],
+    );
+    check(
+        "Cassandra",
+        refused_types(&*cassandra, DbKind::Cassandra, "sonde_types"),
+    );
+    setup(&*cassandra, &["DROP KEYSPACE sonde_types"]);
+
+    let elastic = open(&local(DbKind::Elasticsearch, 19200, "", ""), None);
+    let cluster = block_on(elastic.catalog()).unwrap().schemas[0].name.clone();
+    check(
+        "Elasticsearch",
+        refused_types(&*elastic, DbKind::Elasticsearch, &cluster),
+    );
+
+    assert!(refused.is_empty(), "refused types:\n{}", refused.join("\n"));
 }

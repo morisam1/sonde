@@ -731,6 +731,20 @@ fn main() -> ExitCode {
     ui.click_label("New table…");
     ui.fill("manage-name", "made_here");
     ui.fill("column-name-1", "label");
+    ui.click("column-type-1");
+    ui.shot("13a0-type-menu");
+    // The list opens on the current type, text; step down to varchar.
+    let types = sonde_core::ddl::column_types(sonde_core::DbKind::Postgres);
+    let at = |name: &str| types.iter().position(|t| t.name == name).unwrap();
+    for _ in at("text")..at("varchar") {
+        ui.press("down");
+    }
+    ui.press("enter");
+    report.check(
+        "manage: picking varchar from the type list asks for its size, filled with 255",
+        ui.with(|window, _| window.try_find("column-size-1").is_some())
+            && ui.has_label("Column 2 size"),
+    );
     ui.shot("13a-new-table");
     report.check(
         "manage: the dialog is ready to create the table",

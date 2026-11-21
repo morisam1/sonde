@@ -21,6 +21,290 @@ pub struct NewColumn {
     pub nullable: bool,
     /// Whether it is part of the primary key.
     pub primary_key: bool,
+    /// Its default, as an expression in the database's language, such as
+    /// `0`, `'new'` or `now()`. Empty for none.
+    pub default: Option<String>,
+}
+
+/// A column type a database offers, for the type chooser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnType {
+    /// The type's name, as written in DDL: `varchar`, `list`.
+    pub name: &'static str,
+    /// The arguments it takes, with sensible values: `255` for `varchar`,
+    /// `10,2` for `numeric`, `text` for a Cassandra `list`. `None` when it
+    /// takes none.
+    pub args: Option<&'static str>,
+    /// Whether the arguments go in angle brackets, as for Cassandra's
+    /// collections (`list<text>`), rather than parentheses.
+    pub angle: bool,
+}
+
+impl ColumnType {
+    const fn plain(name: &'static str) -> Self {
+        Self {
+            name,
+            args: None,
+            angle: false,
+        }
+    }
+
+    const fn with(name: &'static str, args: &'static str) -> Self {
+        Self {
+            name,
+            args: Some(args),
+            angle: false,
+        }
+    }
+
+    const fn generic(name: &'static str, args: &'static str) -> Self {
+        Self {
+            name,
+            args: Some(args),
+            angle: true,
+        }
+    }
+
+    /// The type written out with `args`: `varchar(100)`, or `list<int>` for
+    /// Cassandra's collections. Empty arguments leave the name alone.
+    pub fn spelled(&self, args: &str) -> String {
+        let args = args.trim();
+        if self.args.is_none() || args.is_empty() {
+            return self.name.to_owned();
+        }
+        if self.angle {
+            format!("{}<{args}>", self.name)
+        } else {
+            format!("{}({args})", self.name)
+        }
+    }
+}
+
+/// The column types `kind` offers, most used first. Empty for databases
+/// without column types (MongoDB, Redis).
+pub fn column_types(kind: DbKind) -> &'static [ColumnType] {
+    use ColumnType as T;
+    const POSTGRES: &[ColumnType] = &[
+        T::plain("integer"),
+        T::plain("bigint"),
+        T::plain("smallint"),
+        T::plain("serial"),
+        T::plain("bigserial"),
+        T::with("numeric", "10,2"),
+        T::plain("real"),
+        T::plain("double precision"),
+        T::plain("boolean"),
+        T::plain("text"),
+        T::with("varchar", "255"),
+        T::with("char", "1"),
+        T::plain("uuid"),
+        T::plain("date"),
+        T::plain("time"),
+        T::plain("timestamp"),
+        T::plain("timestamptz"),
+        T::plain("interval"),
+        T::plain("jsonb"),
+        T::plain("json"),
+        T::plain("bytea"),
+        T::plain("inet"),
+        T::plain("cidr"),
+        T::plain("macaddr"),
+        T::plain("money"),
+        T::plain("xml"),
+        T::plain("tsvector"),
+        T::plain("text[]"),
+        T::plain("integer[]"),
+    ];
+    const MYSQL: &[ColumnType] = &[
+        T::plain("int"),
+        T::plain("bigint"),
+        T::plain("smallint"),
+        T::plain("tinyint"),
+        T::plain("mediumint"),
+        T::with("decimal", "10,2"),
+        T::plain("float"),
+        T::plain("double"),
+        T::plain("boolean"),
+        T::with("bit", "1"),
+        T::with("varchar", "255"),
+        T::with("char", "1"),
+        T::plain("text"),
+        T::plain("tinytext"),
+        T::plain("mediumtext"),
+        T::plain("longtext"),
+        T::plain("json"),
+        T::plain("date"),
+        T::plain("time"),
+        T::plain("datetime"),
+        T::plain("timestamp"),
+        T::plain("year"),
+        T::with("binary", "16"),
+        T::with("varbinary", "255"),
+        T::plain("blob"),
+        T::plain("mediumblob"),
+        T::plain("longblob"),
+        T::with("enum", "'a','b'"),
+        T::with("set", "'a','b'"),
+    ];
+    const MARIADB: &[ColumnType] = &[
+        T::plain("int"),
+        T::plain("bigint"),
+        T::plain("smallint"),
+        T::plain("tinyint"),
+        T::plain("mediumint"),
+        T::with("decimal", "10,2"),
+        T::plain("float"),
+        T::plain("double"),
+        T::plain("boolean"),
+        T::with("bit", "1"),
+        T::with("varchar", "255"),
+        T::with("char", "1"),
+        T::plain("text"),
+        T::plain("tinytext"),
+        T::plain("mediumtext"),
+        T::plain("longtext"),
+        T::plain("json"),
+        T::plain("uuid"),
+        T::plain("inet6"),
+        T::plain("date"),
+        T::plain("time"),
+        T::plain("datetime"),
+        T::plain("timestamp"),
+        T::plain("year"),
+        T::with("binary", "16"),
+        T::with("varbinary", "255"),
+        T::plain("blob"),
+        T::plain("mediumblob"),
+        T::plain("longblob"),
+        T::with("enum", "'a','b'"),
+        T::with("set", "'a','b'"),
+    ];
+    const SQLSERVER: &[ColumnType] = &[
+        T::plain("int"),
+        T::plain("bigint"),
+        T::plain("smallint"),
+        T::plain("tinyint"),
+        T::plain("bit"),
+        T::with("decimal", "18,2"),
+        T::with("numeric", "18,2"),
+        T::plain("money"),
+        T::plain("float"),
+        T::plain("real"),
+        T::with("nvarchar", "255"),
+        T::with("varchar", "255"),
+        T::with("nchar", "1"),
+        T::with("char", "1"),
+        T::plain("uniqueidentifier"),
+        T::plain("date"),
+        T::with("time", "7"),
+        T::with("datetime2", "7"),
+        T::with("datetimeoffset", "7"),
+        T::plain("datetime"),
+        T::plain("smalldatetime"),
+        T::with("varbinary", "max"),
+        T::with("binary", "16"),
+        T::plain("xml"),
+    ];
+    const SQLITE: &[ColumnType] = &[
+        T::plain("INTEGER"),
+        T::plain("TEXT"),
+        T::plain("REAL"),
+        T::plain("NUMERIC"),
+        T::plain("BLOB"),
+        T::plain("BOOLEAN"),
+        T::plain("DATE"),
+        T::plain("DATETIME"),
+        T::plain("JSON"),
+    ];
+    const SNOWFLAKE: &[ColumnType] = &[
+        T::with("NUMBER", "38,0"),
+        T::plain("INTEGER"),
+        T::plain("FLOAT"),
+        T::plain("BOOLEAN"),
+        T::plain("VARCHAR"),
+        T::with("CHAR", "1"),
+        T::plain("BINARY"),
+        T::plain("DATE"),
+        T::plain("TIME"),
+        T::plain("TIMESTAMP_NTZ"),
+        T::plain("TIMESTAMP_LTZ"),
+        T::plain("TIMESTAMP_TZ"),
+        T::plain("VARIANT"),
+        T::plain("OBJECT"),
+        T::plain("ARRAY"),
+        T::plain("GEOGRAPHY"),
+        T::plain("GEOMETRY"),
+    ];
+    const CASSANDRA: &[ColumnType] = &[
+        T::plain("text"),
+        T::plain("int"),
+        T::plain("bigint"),
+        T::plain("smallint"),
+        T::plain("tinyint"),
+        T::plain("varint"),
+        T::plain("decimal"),
+        T::plain("double"),
+        T::plain("float"),
+        T::plain("boolean"),
+        T::plain("uuid"),
+        T::plain("timeuuid"),
+        T::plain("timestamp"),
+        T::plain("date"),
+        T::plain("time"),
+        T::plain("duration"),
+        T::plain("blob"),
+        T::plain("inet"),
+        T::plain("ascii"),
+        T::plain("counter"),
+        T::generic("list", "text"),
+        T::generic("set", "text"),
+        T::generic("map", "text, text"),
+        T::generic("frozen", "list<text>"),
+    ];
+    const ELASTIC: &[ColumnType] = &[
+        T::plain("keyword"),
+        T::plain("text"),
+        T::plain("long"),
+        T::plain("integer"),
+        T::plain("short"),
+        T::plain("byte"),
+        T::plain("double"),
+        T::plain("float"),
+        T::plain("half_float"),
+        T::plain("unsigned_long"),
+        T::plain("boolean"),
+        T::plain("date"),
+        T::plain("date_nanos"),
+        T::plain("ip"),
+        T::plain("binary"),
+        T::plain("geo_point"),
+        T::plain("geo_shape"),
+        T::plain("object"),
+        T::plain("nested"),
+        T::plain("flattened"),
+        T::plain("wildcard"),
+        T::plain("match_only_text"),
+        T::plain("version"),
+    ];
+    match kind {
+        DbKind::Postgres => POSTGRES,
+        DbKind::Mysql => MYSQL,
+        DbKind::Mariadb => MARIADB,
+        DbKind::SqlServer => SQLSERVER,
+        DbKind::Sqlite => SQLITE,
+        DbKind::Snowflake => SNOWFLAKE,
+        DbKind::Cassandra => CASSANDRA,
+        DbKind::Elasticsearch => ELASTIC,
+        DbKind::Mongodb | DbKind::Redis => &[],
+    }
+}
+
+/// Whether `kind` takes a default value for a column.
+pub fn supports_defaults(kind: DbKind) -> bool {
+    !matches!(
+        kind,
+        DbKind::Cassandra | DbKind::Elasticsearch | DbKind::Mongodb | DbKind::Redis
+    )
 }
 
 /// The kinds of value a new Redis key starts with.
@@ -225,6 +509,16 @@ fn mongo_coll(table: &TableRef) -> String {
 
 fn column_sql(kind: DbKind, column: &NewColumn, quote: &dyn Fn(&str) -> String) -> String {
     let mut sql = format!("{} {}", quote(&column.name), column.type_name.trim());
+    if supports_defaults(kind)
+        && let Some(default) = column
+            .default
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+    {
+        sql.push_str(" DEFAULT ");
+        sql.push_str(default);
+    }
     // Cassandra has no NOT NULL; its key columns can never be null anyway.
     if !column.nullable && kind != DbKind::Cassandra {
         sql.push_str(" NOT NULL");
@@ -546,12 +840,14 @@ mod tests {
                 type_name: "bigint".into(),
                 nullable: true,
                 primary_key: true,
+                default: None,
             },
             NewColumn {
                 name: "name".into(),
                 type_name: "text".into(),
                 nullable: false,
                 primary_key: false,
+                default: None,
             },
         ]
     }
@@ -654,5 +950,51 @@ mod tests {
             ["SET user:1 \"hello world\" NX"]
         );
         assert!(key(KeyType::Hash, "name").is_err());
+    }
+
+    #[test]
+    fn column_types_should_spell_their_arguments() {
+        let varchar = column_types(DbKind::Postgres)
+            .iter()
+            .find(|t| t.name == "varchar")
+            .unwrap();
+        let list = column_types(DbKind::Cassandra)
+            .iter()
+            .find(|t| t.name == "list")
+            .unwrap();
+
+        assert_eq!(varchar.spelled("100"), "varchar(100)");
+        assert_eq!(varchar.spelled(" "), "varchar");
+        assert_eq!(list.spelled("int"), "list<int>");
+        let set = column_types(DbKind::Mysql)
+            .iter()
+            .find(|t| t.name == "set")
+            .unwrap();
+        assert_eq!(set.spelled("'a','b'"), "set('a','b')");
+        assert!(column_types(DbKind::Mongodb).is_empty());
+        for kind in DbKind::ALL {
+            if supports(kind, Op::CreateTable) && !matches!(kind, DbKind::Mongodb) {
+                assert!(!column_types(kind).is_empty(), "{kind:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn defaults_should_come_before_not_null() {
+        let change = Change::AddColumn {
+            table: TableRef::new("public", "t"),
+            column: NewColumn {
+                name: "n".into(),
+                type_name: "integer".into(),
+                nullable: false,
+                primary_key: false,
+                default: Some("0".into()),
+            },
+        };
+
+        assert_eq!(
+            statements(DbKind::Postgres, &change).unwrap(),
+            ["ALTER TABLE \"public\".\"t\" ADD COLUMN \"n\" integer DEFAULT 0 NOT NULL"]
+        );
     }
 }

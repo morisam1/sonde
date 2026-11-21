@@ -8,12 +8,13 @@ use std::sync::Arc;
 
 use futures::StreamExt as _;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, IconName, IndexPath, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
     input::{Input, InputEvent, InputState},
     radio::RadioGroup,
+    select::{Select, SelectEvent, SelectState},
     v_flex,
 };
 use gpui_kit::{prelude::FluentBuilder as _, *};
@@ -142,6 +143,24 @@ impl Task {
         )
     }
 
+    /// Where the change happens, for the dialog's first line.
+    fn place(&self, kind: DbKind) -> Option<String> {
+        let table = table_noun(kind);
+        Some(match self {
+            Self::CreateTable { schema } => format!("The new {table} goes in {schema}."),
+            Self::AddColumn(t) => format!(
+                "The new {} goes at the end of {}.",
+                column_noun(kind),
+                t.name
+            ),
+            Self::RenameTable(t) => format!("Renames the {table} {}.", t.name),
+            Self::RenameColumn { table: t, column } => {
+                format!("Renames the {} {column} of {}.", column_noun(kind), t.name)
+            }
+            _ => return None,
+        })
+    }
+
     /// What a destructive change takes with it, in words.
     fn warning(&self, kind: DbKind) -> Option<String> {
         let table = table_noun(kind);
@@ -176,11 +195,50 @@ impl Task {
     }
 }
 
+/// The type chooser's last choice, for types the list does not have.
+const CUSTOM: &str = "Custom type…";
+
+type TypeSelect = SelectState<Vec<SharedString>>;
+
 struct ColumnRow {
     name: Entity<InputState>,
-    type_name: Entity<InputState>,
+    /// The database's types, and [`CUSTOM`] last.
+    type_choice: Entity<TypeSelect>,
+    /// The type's arguments: a size, a precision, a collection's element.
+    args: Entity<InputState>,
+    /// The type, written out, when [`CUSTOM`] is chosen.
+    custom: Entity<InputState>,
+    default: Entity<InputState>,
     key: bool,
     required: bool,
+}
+
+impl ColumnRow {
+    /// The chosen type, or `None` for a custom one.
+    fn chosen(&self, kind: DbKind, cx: &App) -> Option<ddl::ColumnType> {
+        let name = self.type_choice.read(cx).selected_value()?.clone();
+        ddl::column_types(kind)
+            .iter()
+            .copied()
+            .find(|t| t.name == name.as_ref())
+    }
+
+    fn is_custom(&self, cx: &App) -> bool {
+        self.type_choice
+            .read(cx)
+            .selected_value()
+            .is_some_and(|value| value.as_ref() == CUSTOM)
+    }
+
+    /// The type as the DDL writes it.
+    fn type_name(&self, kind: DbKind, cx: &App) -> String {
+        if self.is_custom(cx) {
+            return self.custom.read(cx).value().trim().to_owned();
+        }
+        self.chosen(kind, cx)
+            .map(|t| t.spelled(self.args.read(cx).value().as_ref()))
+            .unwrap_or_default()
+    }
 }
 
 pub(super) struct ManageDialog {
@@ -246,8 +304,7 @@ impl ManageDialog {
                 };
                 if let Some(id) = id {
                     let int = match kind {
-                        DbKind::Sqlite => "INTEGER",
-                        DbKind::Snowflake => "NUMBER",
+                        DbKind::Sqlite | DbKind::Snowflake => "INTEGER",
                         DbKind::Cassandra | DbKind::Mysql | DbKind::Mariadb | DbKind::SqlServer => {
                             "int"
                         }
@@ -277,6 +334,8 @@ impl ManageDialog {
         }
     }
 
+    /// Add a column row with `type_name` chosen: a name from the database's
+    /// type list (`varchar`), or a full type when the list lacks it.
     fn add_column(
         &mut self,
         name: &str,
@@ -285,23 +344,67 @@ impl ManageDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let kind = self.kind;
+        let types = ddl::column_types(kind);
+        let mut choices: Vec<SharedString> =
+            types.iter().map(|t| SharedString::from(t.name)).collect();
+        choices.push(CUSTOM.into());
+        let base = type_name
+            .split(['(', '<'])
+            .next()
+            .unwrap_or(type_name)
+            .trim();
+        let listed = types.iter().position(|t| t.name.eq_ignore_ascii_case(base));
+        let selected = listed.unwrap_or(choices.len() - 1);
+        let args_default = listed.and_then(|ix| types[ix].args).unwrap_or_default();
+
         let name = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(name.to_owned())
-                .placeholder("column")
+                .placeholder(column_noun(kind))
         });
-        let type_name = cx.new(|cx| {
+        let type_choice = cx.new(|cx| {
+            SelectState::new(choices, Some(IndexPath::new(selected)), window, cx).searchable(true)
+        });
+        let args = cx.new(|cx| InputState::new(window, cx).default_value(args_default.to_owned()));
+        let custom = cx.new(|cx| {
             InputState::new(window, cx)
-                .default_value(type_name.to_owned())
-                .placeholder("type")
+                .default_value(if listed.is_none() {
+                    type_name.to_owned()
+                } else {
+                    String::new()
+                })
+                .placeholder("type, as the database writes it")
         });
-        self._subscriptions
-            .push(cx.subscribe(&name, Self::on_input));
-        self._subscriptions
-            .push(cx.subscribe(&type_name, Self::on_input));
+        let default = cx.new(|cx| InputState::new(window, cx).placeholder("none"));
+        for input in [&name, &args, &custom, &default] {
+            self._subscriptions
+                .push(cx.subscribe(input, Self::on_input));
+        }
+        // A new type brings its own arguments.
+        self._subscriptions.push(cx.subscribe_in(
+            &type_choice,
+            window,
+            move |this, choice, _: &SelectEvent<Vec<SharedString>>, window, cx| {
+                if let Some(row) = this.columns.iter().find(|row| row.type_choice == *choice) {
+                    let args = row
+                        .chosen(kind, cx)
+                        .and_then(|t| t.args)
+                        .unwrap_or_default()
+                        .to_owned();
+                    row.args
+                        .update(cx, |input, cx| input.set_value(args, window, cx));
+                }
+                this.problem = None;
+                cx.notify();
+            },
+        ));
         self.columns.push(ColumnRow {
             name,
-            type_name,
+            type_choice,
+            args,
+            custom,
+            default,
             key,
             required: key,
         });
@@ -317,9 +420,10 @@ impl ManageDialog {
             .iter()
             .map(|row| NewColumn {
                 name: Self::text(&row.name, cx),
-                type_name: Self::text(&row.type_name, cx),
+                type_name: row.type_name(self.kind, cx),
                 nullable: !row.required,
                 primary_key: row.key,
+                default: Some(Self::text(&row.default, cx)).filter(|d| !d.is_empty()),
             })
             .collect()
     }
@@ -356,6 +460,7 @@ impl ManageDialog {
                         type_name: String::new(),
                         nullable: true,
                         primary_key: false,
+                        default: None,
                     }),
             },
             Task::RenameColumn { table, column } => Change::RenameColumn {
@@ -436,15 +541,213 @@ impl ManageDialog {
     }
 }
 
+impl ManageDialog {
+    /// The column editor: a header, then one row per column, each with its
+    /// name, type, size, default, and whether it is a key or required.
+    fn render_columns(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let (quiet, border) = (theme.muted_foreground, theme.border);
+        let kind = self.kind;
+        let column = column_noun(kind);
+        let creating = matches!(self.task, Task::CreateTable { .. });
+        let keyed = creating && kind.language() != Language::Elastic;
+        let typed = !ddl::column_types(kind).is_empty();
+        let required = kind.language() != Language::Elastic && kind != DbKind::Cassandra;
+        let defaults = ddl::supports_defaults(kind);
+        let removable = creating && self.columns.len() > 1;
+
+        let heading = |text: &'static str| {
+            div()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(quiet)
+                .child(text)
+        };
+        let header = h_flex()
+            .gap_2()
+            .px_1()
+            .child(div().flex_1().min_w(px(120.)).child(heading("Name")))
+            .when(typed, |this| {
+                this.child(div().w(px(176.)).flex_none().child(heading("Type")))
+                    .child(div().w(px(92.)).flex_none().child(heading("Size")))
+            })
+            .when(defaults, |this| {
+                this.child(div().w(px(110.)).flex_none().child(heading("Default")))
+            })
+            .when(keyed, |this| {
+                this.child(
+                    div()
+                        .w(px(36.))
+                        .flex_none()
+                        .text_center()
+                        .child(heading("Key")),
+                )
+            })
+            .when(required, |this| {
+                this.child(
+                    div()
+                        .w(px(64.))
+                        .flex_none()
+                        .text_center()
+                        .child(heading("Required")),
+                )
+            })
+            .when(removable, |this| this.child(div().w(px(28.)).flex_none()));
+
+        let mut rows = v_flex().gap_2();
+        for (ix, row) in self.columns.iter().enumerate() {
+            let custom = row.is_custom(cx);
+            let takes_args = row.chosen(kind, cx).is_some_and(|t| t.args.is_some());
+            let mut line = h_flex().gap_2().items_center().child(
+                div().flex_1().min_w(px(120.)).child(
+                    Input::new(&row.name)
+                        .id(SharedString::from(format!("column-name-{ix}")))
+                        .aria_label(format!("{} {} name", capital(column), ix + 1)),
+                ),
+            );
+            if typed {
+                line = line
+                    .child(
+                        div().w(px(176.)).flex_none().child(
+                            Select::new(&row.type_choice)
+                                .id(SharedString::from(format!("column-type-{ix}")))
+                                .accessibility_label(format!("{} {} type", capital(column), ix + 1))
+                                .search_placeholder("Search types")
+                                .menu_width(px(220.)),
+                        ),
+                    )
+                    .child(div().w(px(92.)).flex_none().map(|this| {
+                        if custom {
+                            this.child(
+                                Input::new(&row.custom)
+                                    .id(SharedString::from(format!("column-custom-{ix}")))
+                                    .aria_label(format!(
+                                        "{} {} custom type",
+                                        capital(column),
+                                        ix + 1
+                                    )),
+                            )
+                        } else if takes_args {
+                            this.child(
+                                Input::new(&row.args)
+                                    .id(SharedString::from(format!("column-size-{ix}")))
+                                    .aria_label(format!("{} {} size", capital(column), ix + 1)),
+                            )
+                        } else {
+                            this.child(div().text_sm().text_color(quiet).px_2().child("—"))
+                        }
+                    }));
+            }
+            if defaults {
+                line = line.child(
+                    div().w(px(110.)).flex_none().child(
+                        Input::new(&row.default)
+                            .id(SharedString::from(format!("column-default-{ix}")))
+                            .aria_label(format!("{} {} default", capital(column), ix + 1)),
+                    ),
+                );
+            }
+            if keyed {
+                line = line.child(
+                    div().w(px(36.)).flex_none().flex().justify_center().child(
+                        Checkbox::new(SharedString::from(format!("column-key-{ix}")))
+                            .checked(row.key)
+                            .tooltip("Part of the primary key")
+                            .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                                if let Some(row) = this.columns.get_mut(ix) {
+                                    row.key = *checked;
+                                    row.required |= *checked;
+                                }
+                                cx.notify();
+                            })),
+                    ),
+                );
+            }
+            if required {
+                line = line.child(
+                    div().w(px(64.)).flex_none().flex().justify_center().child(
+                        Checkbox::new(SharedString::from(format!("column-required-{ix}")))
+                            .checked(row.required)
+                            .tooltip("NOT NULL: a value is needed")
+                            .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                                if let Some(row) = this.columns.get_mut(ix) {
+                                    row.required = *checked || row.key;
+                                }
+                                cx.notify();
+                            })),
+                    ),
+                );
+            }
+            if removable {
+                line = line.child(
+                    div().w(px(28.)).flex_none().child(
+                        Button::new(SharedString::from(format!("column-remove-{ix}")))
+                            .ghost()
+                            .small()
+                            .icon(IconName::Close)
+                            .accessibility_label(format!("Remove {} {}", column, ix + 1))
+                            .tooltip(format!("Remove this {column}"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if ix < this.columns.len() {
+                                    this.columns.remove(ix);
+                                }
+                                cx.notify();
+                            })),
+                    ),
+                );
+            }
+            rows = rows.child(line);
+        }
+
+        let second = ddl::default_type(kind);
+        v_flex()
+            .gap_2()
+            .child(Self::label(format!("{}s", capital(column))))
+            .child(
+                v_flex()
+                    .gap_2()
+                    .p_3()
+                    .rounded(px(crate::design::RADIUS_ITEM))
+                    .border_1()
+                    .border_color(border)
+                    .child(header)
+                    .child(
+                        div()
+                            .id("manage-columns")
+                            .max_h(px(260.))
+                            .overflow_y_scroll()
+                            .child(rows),
+                    )
+                    .when(creating, |this| {
+                        this.child(
+                            h_flex().child(
+                                Button::new("add-column-row")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::Plus)
+                                    .label(format!("Add {column}"))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.add_column("", second, false, window, cx);
+                                    })),
+                            ),
+                        )
+                    }),
+            )
+    }
+}
+
 impl Render for ManageDialog {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let columns = (!self.columns.is_empty()).then(|| self.render_columns(cx));
         let theme = cx.theme();
         let quiet = theme.muted_foreground;
         let kind = self.kind;
         let table = table_noun(kind);
-        let column = column_noun(kind);
 
-        let mut body = v_flex().gap_4();
+        let mut body = v_flex().gap_5();
+        if let Some(place) = self.task.place(kind) {
+            body = body.child(div().text_sm().text_color(quiet).child(place));
+        }
         if let Some(warning) = self.task.warning(kind) {
             body = body.child(div().text_sm().text_color(theme.danger).child(warning));
         }
@@ -518,117 +821,45 @@ impl Render for ManageDialog {
                         ),
                 );
         }
-        if !self.columns.is_empty() {
-            let keyed = matches!(self.task, Task::CreateTable { .. })
-                && kind.language() != Language::Elastic;
-            let mut list = v_flex()
-                .gap_2()
-                .child(Self::label(format!("{}s", capital(column))));
-            for (ix, row) in self.columns.iter().enumerate() {
-                let mut line = h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div().flex_1().min_w_0().child(
-                            Input::new(&row.name)
-                                .id(SharedString::from(format!("column-name-{ix}")))
-                                .aria_label(format!("{} {} name", capital(column), ix + 1)),
-                        ),
-                    )
-                    .child(
-                        div().w(px(150.)).flex_none().child(
-                            Input::new(&row.type_name)
-                                .id(SharedString::from(format!("column-type-{ix}")))
-                                .aria_label(format!("{} {} type", capital(column), ix + 1)),
-                        ),
-                    );
-                if keyed {
-                    line = line.child(
-                        Checkbox::new(SharedString::from(format!("column-key-{ix}")))
-                            .label("Key")
-                            .checked(row.key)
-                            .on_click(cx.listener(move |this, checked: &bool, _, cx| {
-                                if let Some(row) = this.columns.get_mut(ix) {
-                                    row.key = *checked;
-                                    row.required |= *checked;
-                                }
-                                cx.notify();
-                            })),
-                    );
-                }
-                if kind.language() != Language::Elastic && kind != DbKind::Cassandra {
-                    line = line.child(
-                        Checkbox::new(SharedString::from(format!("column-required-{ix}")))
-                            .label("Required")
-                            .checked(row.required)
-                            .on_click(cx.listener(move |this, checked: &bool, _, cx| {
-                                if let Some(row) = this.columns.get_mut(ix) {
-                                    row.required = *checked || row.key;
-                                }
-                                cx.notify();
-                            })),
-                    );
-                }
-                if keyed && self.columns.len() > 1 {
-                    line = line.child(
-                        Button::new(SharedString::from(format!("column-remove-{ix}")))
-                            .ghost()
-                            .small()
-                            .icon(IconName::Close)
-                            .accessibility_label("Remove column")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if ix < this.columns.len() {
-                                    this.columns.remove(ix);
-                                }
-                                cx.notify();
-                            })),
-                    );
-                }
-                list = list.child(line);
-            }
-            if matches!(self.task, Task::CreateTable { .. }) {
-                let default = ddl::default_type(kind);
-                list = list.child(
-                    h_flex().child(
-                        Button::new("add-column-row")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Plus)
-                            .label(format!("Add {column}"))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.add_column("", default, false, window, cx);
-                            })),
-                    ),
-                );
-            }
-            body = body.child(list);
-        }
+        body = body.children(columns);
 
         let preview = self.statements(cx);
         body = body.child(
-            v_flex().gap_2().child(Self::label("Runs")).child(
+            v_flex()
+                .gap_2()
+                .child(Self::label(if self.kind.language() == Language::Sql {
+                    "SQL preview"
+                } else {
+                    "Preview"
+                }))
+                .child(
+                    div()
+                        .id("manage-preview")
+                        .max_h(px(150.))
+                        .overflow_y_scroll()
+                        .px_3()
+                        .py_2()
+                        .rounded(px(crate::design::RADIUS_ITEM))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(crate::design::tokens(cx).well)
+                        .font_family(theme.mono_font_family.clone())
+                        .text_sm()
+                        .map(|this| match &preview {
+                            Ok(statements) => this.child(statements.join(";\n")),
+                            Err(problem) => this.text_color(quiet).child(problem.clone()),
+                        }),
+                ),
+        );
+        body = body.when_some(self.problem.clone(), |this, problem| {
+            this.child(
                 div()
-                    .id("manage-preview")
-                    .p_3()
-                    .rounded(px(crate::design::RADIUS_ITEM))
-                    .bg(theme.muted)
-                    .font_family(theme.mono_font_family.clone())
+                    .id("manage-status")
                     .text_sm()
-                    .whitespace_normal()
-                    .map(|this| match &preview {
-                        Ok(statements) => this.child(statements.join(";\n")),
-                        Err(problem) => this.text_color(quiet).child(problem.clone()),
-                    }),
-            ),
-        );
-        body = body.child(
-            div()
-                .id("manage-status")
-                .min_h_5()
-                .text_sm()
-                .text_color(theme.danger)
-                .when_some(self.problem.clone(), |this, problem| this.child(problem)),
-        );
+                    .text_color(theme.danger)
+                    .child(problem),
+            )
+        });
 
         let action = match &self.task {
             Task::DropDatabase(_)
@@ -661,6 +892,9 @@ impl Render for ManageDialog {
         body.child(
             h_flex()
                 .gap_2()
+                .pt_4()
+                .border_t_1()
+                .border_color(theme.border)
                 .child(div().flex_1())
                 .child(
                     Button::new("manage-cancel")
@@ -693,12 +927,19 @@ pub(super) fn open(
             | Task::DropColumn { .. }
             | Task::FlushDatabase(_)
     ) && !(matches!(task, Task::AddColumn(_)) && kind != DbKind::Mongodb);
+    // The column editor needs room for its grid.
+    let width = match task {
+        Task::CreateTable { .. } | Task::AddColumn(_) if !ddl::column_types(kind).is_empty() => {
+            820.
+        }
+        _ => 540.,
+    };
     let view = cx.new(|cx| ManageDialog::new(kind, task, session, on_done, window, cx));
     let name = view.read(cx).name.clone();
     window.open_dialog(cx, move |dialog, _, _| {
         dialog
             .title(title.clone())
-            .w(px(600.))
+            .w(px(width))
             .p_6()
             .child(view.clone())
     });
