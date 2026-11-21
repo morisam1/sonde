@@ -1,0 +1,62 @@
+# Checks every pull request and push: formatting, lints, unit tests, and
+# the driver tests against the lighter database containers. (SQL Server,
+# Cassandra and Elasticsearch need more memory than a hosted runner gives
+# comfortably; run their suites locally.)
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux build libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake clang \
+            libasound2-dev libfontconfig-dev libfreetype-dev libwayland-dev \
+            libx11-xcb-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libvulkan-dev libzstd-dev libdbus-1-dev
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --lib --locked
+      - name: Driver tests that need no server
+        run: cargo test -p sonde-core --locked --test sqlite --test snowflake --test update
+
+  install-scripts:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck install.sh packaging/linux/install.sh packaging/linux/register-launcher.sh
+      - name: Parse install.ps1
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors; exit 1 }
+
+  databases:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start the database containers
+        run: docker compose -f tests/docker-compose.yml up -d --wait postgres mysql mariadb redis valkey mongo
+      - name: Driver tests
+        run: |
+          cargo test -p sonde-core --locked --test postgres --test postgres_memory --test mysql --test redis --test mongo
+          SONDE_TEST_MARIADB=1 cargo test -p sonde-core --locked --test mysql

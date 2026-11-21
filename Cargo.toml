@@ -1,0 +1,62 @@
+[workspace]
+resolver = "3"
+members = ["crates/sonde-core", "crates/sonde-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[workspace.dependencies]
+sonde-core = { path = "crates/sonde-core" }
+gpui-kit = { version = "=0.9.1", features = ["tree-sitter", "tree-sitter-sql"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-postgres = "0.7.18"
+tokio-postgres-rustls = "0.14.0"
+mysql_async = { version = "0.37.1", default-features = false, features = ["default-rustls-ring"] }
+tiberius = { version = "0.13.0", default-features = false, features = ["tds80", "rustls", "chrono", "rust_decimal"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+redis = { version = "1.8.2", default-features = false, features = ["acl", "streams", "tokio-comp", "tokio-rustls-comp", "tls-rustls-insecure"] }
+mongodb = "3.10.2"
+bson = "2.15"
+scylla = { version = "1.10.0", features = ["chrono-04", "rustls-023"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider", "http2", "gzip"] }
+base64 = "0.22"
+semver = "1.0.28"
+sha2 = "0.10"
+flate2 = "1.1.10"
+tar = "0.4.46"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+self-replace = "1.5.1"
+postgres-protocol = "0.6"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+rusqlite = { version = "0.42.0", features = ["bundled", "column_decltype", "column_metadata"] }
+sqlparser = "0.64.0"
+async-trait = "0.1"
+bytes = "1"
+fallible-iterator = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+uuid = "1"
+rust_decimal = "1"
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+csv = "1.4.0"
+toml = "1.2"
+directories = "6.0.0"
+keyring = "4.2.0"
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Debug info is most of a dev build's size, and every test file links the
+# whole stack (GPUI, ten drivers) into a binary of its own. Line tables keep
+# backtraces and panics pointing at file and line for Sonde's own code;
+# dependencies carry none. `split-debuginfo` keeps it out of each binary.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = false

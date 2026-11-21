@@ -1,0 +1,51 @@
+[package]
+name = "sonde-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tokio-postgres.workspace = true
+tokio-postgres-rustls.workspace = true
+mysql_async.workspace = true
+tiberius.workspace = true
+tokio-util.workspace = true
+redis.workspace = true
+mongodb.workspace = true
+bson.workspace = true
+scylla.workspace = true
+reqwest.workspace = true
+base64.workspace = true
+semver.workspace = true
+sha2.workspace = true
+flate2.workspace = true
+tar.workspace = true
+zip.workspace = true
+self-replace.workspace = true
+postgres-protocol.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+rusqlite.workspace = true
+sqlparser.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+fallible-iterator.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+rust_decimal.workspace = true
+serde_json.workspace = true
+csv.workspace = true
+futures.workspace = true
+serde.workspace = true
+toml.workspace = true
+directories.workspace = true
+keyring.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+semver.workspace = true
+sha2.workspace = true
+flate2.workspace = true
+tar.workspace = true
+rusqlite.workspace = true

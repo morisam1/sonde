@@ -1,0 +1,117 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: sonde
+      POSTGRES_PASSWORD: sonde
+      POSTGRES_DB: sonde
+    ports:
+      - "127.0.0.1:54329:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sonde"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: sonde
+      MYSQL_USER: sonde
+      MYSQL_PASSWORD: sonde
+      MYSQL_DATABASE: sonde
+    ports:
+      - "127.0.0.1:33069:3306"
+    volumes:
+      # Lets the test user create a database per test.
+      - ./mysql-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -usonde -psonde --silent"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Sonde-pass1"
+      MSSQL_PID: Developer
+    ports:
+      - "127.0.0.1:14339:1433"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P Sonde-pass1 -Q 'SELECT 1' || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+  mariadb:
+    image: mariadb:11.4
+    environment:
+      MARIADB_ROOT_PASSWORD: sonde
+      MARIADB_USER: sonde
+      MARIADB_PASSWORD: sonde
+      MARIADB_DATABASE: sonde
+    ports:
+      - "127.0.0.1:33070:3306"
+    volumes:
+      - ./mysql-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+  redis:
+    image: redis:7.4
+    ports:
+      - "127.0.0.1:63799:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+  valkey:
+    image: valkey/valkey:8
+    command: ["valkey-server", "--requirepass", "sonde"]
+    ports:
+      - "127.0.0.1:63800:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "sonde", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+  mongo:
+    image: mongo:8.0
+    # A one-member replica set, so transactions work.
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "127.0.0.1:27019:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "try { rs.status().ok } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:27017'}]}).ok }"]
+      interval: 3s
+      timeout: 10s
+      retries: 40
+  cassandra:
+    image: cassandra:5.0
+    environment:
+      MAX_HEAP_SIZE: 768M
+      HEAP_NEWSIZE: 128M
+    ports:
+      - "127.0.0.1:19042:9042"
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'DESCRIBE KEYSPACES' > /dev/null"]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+  elasticsearch:
+    image: elasticsearch:8.18.0
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      # Development disks are often fuller than the default watermarks allow.
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "127.0.0.1:19200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -qv '\"status\":\"red\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 60

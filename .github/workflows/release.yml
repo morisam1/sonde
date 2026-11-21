@@ -1,0 +1,245 @@
+# Builds Sonde for Linux, Windows and macOS and publishes it on GitHub
+# Releases, where the in-app updater looks for new versions.
+#
+# Two channels:
+#   stable   a `vX.Y.Z` tag. The tag must match the version in Cargo.toml.
+#   nightly  every push to master. It replaces the release tagged `nightly`,
+#            versioned X.Y.Z-nightly.DATE.RUN.
+#
+# Package names are what the updater expects (see crates/sonde-core/src/update.rs):
+#   sonde-x86_64-unknown-linux-gnu.tar.gz
+#   sonde-x86_64-pc-windows-msvc.zip
+#   sonde-universal-apple-darwin.zip   (holds Sonde.app)
+# each with a `.sha256` beside it.
+#
+# macOS signing and notarization run when these secrets are set; without
+# them the app is signed ad hoc and macOS asks before the first start:
+#   MACOS_CERTIFICATE           base64 of a Developer ID Application .p12
+#   MACOS_CERTIFICATE_PASSWORD  its password
+#   MACOS_SIGNING_IDENTITY      e.g. "Developer ID Application: Name (TEAMID)"
+#   APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD   for notarytool
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      channel: ${{ steps.version.outputs.channel }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: version
+        name: Work out the version
+        run: |
+          base=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            if [[ "$version" != "$base" ]]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $base"
+              exit 1
+            fi
+            channel=stable
+          else
+            # Once vX.Y.Z is out, nightlies must sort after it, or nightly
+            # users would never be offered one again: number them after the
+            # next patch until Cargo.toml moves on.
+            if git rev-parse -q --verify "refs/tags/v$base" > /dev/null; then
+              IFS=. read -r major minor patch <<< "$base"
+              base="$major.$minor.$((patch + 1))"
+            fi
+            version="$base-nightly.$(date -u +%Y%m%d).$GITHUB_RUN_NUMBER"
+            channel=nightly
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "Building Sonde $version ($channel)"
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-15
+            target: universal-apple-darwin
+    runs-on: ${{ matrix.os }}
+    env:
+      SONDE_VERSION: ${{ needs.version.outputs.version }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Linux build libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake clang \
+            libasound2-dev libfontconfig-dev libfreetype-dev libwayland-dev \
+            libx11-xcb-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libvulkan-dev libzstd-dev libdbus-1-dev
+
+      - name: Build (Linux, Windows)
+        if: runner.os != 'macOS'
+        run: cargo build --release --locked -p sonde-app
+
+      - name: Build (macOS, both architectures)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --locked -p sonde-app --target aarch64-apple-darwin
+          cargo build --release --locked -p sonde-app --target x86_64-apple-darwin
+          mkdir -p target/release
+          lipo -create -output target/release/sonde \
+            target/aarch64-apple-darwin/release/sonde \
+            target/x86_64-apple-darwin/release/sonde
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          name="sonde-${{ matrix.target }}.tar.gz"
+          mkdir -p dist/sonde
+          cp target/release/sonde dist/sonde/
+          cp crates/sonde-app/assets/sonde.png packaging/linux/install.sh README.md dist/sonde/
+          cp LICENSE dist/sonde/ 2>/dev/null || true
+          tar -C dist -czf "dist/$name" sonde
+          (cd dist && sha256sum "$name" > "$name.sha256")
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          name="sonde-${{ matrix.target }}.zip"
+          mkdir -p dist/sonde
+          cp target/release/sonde.exe README.md dist/sonde/
+          cp LICENSE dist/sonde/ 2>/dev/null || true
+          (cd dist && 7z a -tzip "$name" sonde > /dev/null)
+          (cd dist && sha256sum "$name" > "$name.sha256")
+
+      - name: Make the app bundle (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          app=dist/Sonde.app
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp target/release/sonde "$app/Contents/MacOS/sonde"
+          short="${SONDE_VERSION%%-*}"
+          sed -e "s/@VERSION@/$SONDE_VERSION/" -e "s/@SHORT_VERSION@/$short/" \
+            packaging/macos/Info.plist > "$app/Contents/Info.plist"
+          iconset=dist/Sonde.iconset
+          mkdir -p "$iconset"
+          for size in 16 32 128 256 512; do
+            sips -z $size $size crates/sonde-app/assets/sonde.png --out "$iconset/icon_${size}x${size}.png" > /dev/null
+            double=$((size * 2))
+            sips -z $double $double crates/sonde-app/assets/sonde.png --out "$iconset/icon_${size}x${size}@2x.png" > /dev/null
+          done
+          iconutil -c icns "$iconset" -o "$app/Contents/Resources/Sonde.icns"
+          rm -rf "$iconset"
+
+      - name: Sign and notarize (macOS)
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          app=dist/Sonde.app
+          if [[ -z "$MACOS_CERTIFICATE" ]]; then
+            echo "No signing certificate; signing ad hoc."
+            codesign --force --deep --sign - "$app"
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/sonde.keychain-db"
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p ci "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p ci "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$keychain"
+          security list-keychain -d user -s "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci "$keychain"
+          codesign --force --options runtime --timestamp \
+            --sign "$MACOS_SIGNING_IDENTITY" "$app"
+          if [[ -n "$APPLE_ID" ]]; then
+            ditto -c -k --keepParent "$app" "$RUNNER_TEMP/notarize.zip"
+            xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" --wait \
+              --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+            xcrun stapler staple "$app"
+          fi
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          name="sonde-${{ matrix.target }}.zip"
+          (cd dist && ditto -c -k --keepParent Sonde.app "$name")
+          (cd dist && shasum -a 256 "$name" > "$name.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sonde-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish a stable release
+        if: needs.version.outputs.channel == 'stable'
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Sonde $VERSION" --generate-notes --verify-tag
+
+      - name: Replace the nightly release
+        if: needs.version.outputs.channel == 'nightly'
+        run: |
+          gh release delete nightly --cleanup-tag --yes || true
+          gh release create nightly dist/* \
+            --prerelease --target "$GITHUB_SHA" \
+            --title "Nightly $VERSION" \
+            --notes "Built from ${GITHUB_SHA::7} on master. Nightly builds are tested less than releases; choose the Nightly channel in Settings to get them."

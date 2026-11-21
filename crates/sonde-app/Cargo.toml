@@ -1,0 +1,68 @@
+[package]
+name = "sonde-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sonde"
+path = "src/main.rs"
+
+[dependencies]
+sonde-core.workspace = true
+gpui-kit.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+url = "2.5"
+semver.workspace = true
+lsp-types = "0.97"
+percent-encoding = "2.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
+sonde-core.workspace = true
+rusqlite.workspace = true
+
+# Drives the real window headlessly and needs the main thread, so it is not a
+# libtest harness.
+[[test]]
+name = "walkthrough"
+path = "tests/walkthrough.rs"
+harness = false
+
+# The query tab's click-through, on the same footing as the walkthrough.
+[[test]]
+name = "query"
+path = "tests/query.rs"
+harness = false
+
+# The table tab's click-through (M4), on the same footing.
+[[test]]
+name = "table"
+path = "tests/table.rs"
+harness = false
+
+# M5's daily-driver features, on the same footing.
+[[test]]
+name = "daily"
+path = "tests/daily.rs"
+harness = false
+
+# MySQL in the real window, on the same footing.
+[[test]]
+name = "mysql"
+path = "tests/mysql.rs"
+harness = false
+
+# SQL Server in the real window, on the same footing.
+[[test]]
+name = "sqlserver"
+path = "tests/sqlserver.rs"
+harness = false
