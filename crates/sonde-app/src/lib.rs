@@ -7,6 +7,7 @@ mod inspector;
 pub mod layout;
 pub mod query;
 pub mod saved_queries;
+pub mod saved_views;
 pub mod session;
 pub mod settings;
 pub mod table_view;

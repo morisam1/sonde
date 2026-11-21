@@ -5,6 +5,7 @@
 
 mod preferences;
 mod queries;
+mod views;
 
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, TitleBar,
@@ -80,6 +81,7 @@ enum TabKind {
 struct Tab {
     kind: TabKind,
     _changes: Subscription,
+    _events: Option<Subscription>,
 }
 
 impl TabKind {
@@ -146,6 +148,9 @@ pub struct Workspace {
     /// Where saved queries go, and what is there.
     queries_dir: std::path::PathBuf,
     saved_queries: Vec<crate::saved_queries::SavedQuery>,
+    /// Where saved views go, and what is there.
+    views_dir: std::path::PathBuf,
+    saved_views: Vec<crate::saved_views::ViewFile>,
     /// The tab on screen; `None` shows the overview.
     active: Option<usize>,
     queries_opened: usize,
@@ -179,6 +184,9 @@ impl Workspace {
         crate::design::install(cx);
         crate::query::init(cx);
         crate::table_view::init(cx);
+        cx.set_global(crate::table_view::columns::TablePrefsFile(
+            dir.join("tables.toml"),
+        ));
         init(cx);
         let layout = layout_file.load();
         layout.appearance.apply(window, cx);
@@ -269,6 +277,8 @@ impl Workspace {
             tabs: Vec::new(),
             saved_queries: crate::saved_queries::list(&dir.join("queries")),
             queries_dir: dir.join("queries"),
+            saved_views: crate::saved_views::list(&dir.join("views")),
+            views_dir: dir.join("views"),
             active: None,
             queries_opened: 0,
             seen_selection: None,
@@ -282,9 +292,14 @@ impl Workspace {
             TabKind::Query(panel) => cx.observe(panel, |_, _, cx| cx.notify()),
             TabKind::Table(panel) => cx.observe(panel, |_, _, cx| cx.notify()),
         };
+        let events = match &kind {
+            TabKind::Table(panel) => Some(cx.subscribe_in(panel, window, Self::on_table_event)),
+            TabKind::Query(_) => None,
+        };
         self.tabs.push(Tab {
             kind,
             _changes: changes,
+            _events: events,
         });
         self.activate(Some(self.tabs.len() - 1), window, cx);
     }
@@ -399,19 +414,21 @@ impl Workspace {
         table: sonde_core::TableRef,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Entity<TableView> {
         let open = self.tabs.iter().position(|tab| match &tab.kind {
             TabKind::Table(panel) => panel.read(cx).shows(&target.id, &table),
             TabKind::Query(_) => false,
         });
-        match open {
-            Some(ix) => self.activate(Some(ix), window, cx),
-            None => {
-                let secrets = self.connections.read(cx).secrets();
-                let panel = cx.new(|cx| TableView::new(target, table, secrets, window, cx));
-                self.push_tab(TabKind::Table(panel), window, cx);
-            }
+        if let Some(ix) = open
+            && let TabKind::Table(panel) = self.tabs[ix].kind.clone()
+        {
+            self.activate(Some(ix), window, cx);
+            return panel;
         }
+        let secrets = self.connections.read(cx).secrets();
+        let panel = cx.new(|cx| TableView::new(target, table, secrets, window, cx));
+        self.push_tab(TabKind::Table(panel.clone()), window, cx);
+        panel
     }
 
     /// The table tabs that are open, oldest first.
@@ -717,6 +734,10 @@ impl Workspace {
                         cx.listener(|this, _, window, cx| this.choose_query_files(window, cx)),
                     ),
             )
+            .when(!self.saved_views.is_empty(), |this| {
+                this.child(div().pt_2().child(ui::group_label("Saved views", cx)))
+                    .child(self.render_saved_views(cx))
+            })
             .when(!self.saved_queries.is_empty(), |this| {
                 this.child(div().pt_2().child(ui::group_label("Saved queries", cx)))
                     .child(

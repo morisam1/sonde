@@ -17,11 +17,15 @@ use crate::{query::QueryTarget, saved_queries};
 
 /// What the name dialog does with the name.
 #[derive(Clone)]
-enum NameFor {
+pub(super) enum NameFor {
     /// Save the query tab at this index under the name.
     Save(usize),
     /// Rename the saved query at this path.
     Rename(PathBuf),
+    /// Save a table tab's view under the name.
+    SaveView(Box<crate::saved_views::SavedView>),
+    /// Rename the saved view at this path.
+    RenameView(PathBuf),
 }
 
 /// A dialog that asks for a query's name.
@@ -56,8 +60,8 @@ impl NameDialog {
 impl Render for NameDialog {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let action = match self.purpose {
-            NameFor::Save(_) => "Save",
-            NameFor::Rename(_) => "Rename",
+            NameFor::Save(_) | NameFor::SaveView(_) => "Save",
+            NameFor::Rename(_) | NameFor::RenameView(_) => "Rename",
         };
         v_flex()
             .gap_3()
@@ -200,7 +204,7 @@ impl Workspace {
         Ok(())
     }
 
-    fn ask_name(
+    pub(super) fn ask_name(
         &mut self,
         purpose: NameFor,
         name: String,
@@ -210,6 +214,8 @@ impl Workspace {
         let title = match purpose {
             NameFor::Save(_) => "Save query",
             NameFor::Rename(_) => "Rename query",
+            NameFor::SaveView(_) => "Save view",
+            NameFor::RenameView(_) => "Rename view",
         };
         let workspace = cx.weak_entity();
         let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
@@ -251,8 +257,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        if matches!(purpose, NameFor::SaveView(_) | NameFor::RenameView(_)) {
+            return self.named_view(purpose, name, cx);
+        }
         let path = saved_queries::path_for(&self.queries_dir, name)?;
         match purpose {
+            // Views were handled above.
+            NameFor::SaveView(_) | NameFor::RenameView(_) => Ok(()),
             NameFor::Save(ix) => {
                 let current = match self.tabs.get(ix).map(|tab| &tab.kind) {
                     Some(TabKind::Query(panel)) => panel.read(cx).path().map(Path::to_path_buf),

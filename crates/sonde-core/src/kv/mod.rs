@@ -115,7 +115,133 @@ impl Dialect for RedisDialect {
     }
 
     fn read_only_reason(&self) -> Option<&'static str> {
-        Some("Redis keys are changed with commands in a query tab, such as HSET, LPUSH or DEL.")
+        None
+    }
+
+    /// A new row becomes `SONDE.ADD key column value ...`, which
+    /// [`RedisSession::apply`] turns into the command for the key's type.
+    fn insert(&self, table: &TableRef, columns: &[&str], values: &[Value]) -> EditStatement {
+        let mut line = format!("{ADD} {}", command::quote(&table.name));
+        for (column, value) in columns.iter().zip(values) {
+            line.push_str(&format!(" {} {}", arg(column), arg(&text(value))));
+        }
+        command_statement(line)
+    }
+
+    fn update(
+        &self,
+        table: &TableRef,
+        key_columns: &[&str],
+        key: &[Value],
+        columns: &[&str],
+        values: &[Value],
+    ) -> EditStatement {
+        let name = command::quote(&table.name);
+        let old = key.first().map(text).unwrap_or_default();
+        let changed = |column: &str| {
+            columns
+                .iter()
+                .position(|c| *c == column)
+                .map(|ix| text(&values[ix]))
+        };
+        let lines: Vec<String> = match key_columns {
+            ["field"] => match (changed("field"), changed("value")) {
+                (Some(field), value) => vec![
+                    // A renamed field keeps its value unless it was changed too.
+                    format!("{RENAME_FIELD} {name} {} {}", arg(&old), arg(&field)),
+                    value
+                        .map(|value| format!("HSET {name} {} {}", arg(&field), arg(&value)))
+                        .unwrap_or_default(),
+                ],
+                (None, Some(value)) => vec![format!("HSET {name} {} {}", arg(&old), arg(&value))],
+                (None, None) => Vec::new(),
+            },
+            ["index"] => changed("value")
+                .map(|value| format!("LSET {name} {} {}", arg(&old), arg(&value)))
+                .into_iter()
+                .collect(),
+            ["member"] => {
+                let member = changed("member").unwrap_or_else(|| old.clone());
+                let mut lines = Vec::new();
+                if member != old {
+                    lines.push(format!(
+                        "{RENAME_MEMBER} {name} {} {}",
+                        arg(&old),
+                        arg(&member)
+                    ));
+                }
+                if let Some(score_text) = changed("score") {
+                    lines.push(format!(
+                        "ZADD {name} {} {}",
+                        score(&score_text),
+                        arg(&member)
+                    ));
+                }
+                lines
+            }
+            _ => changed("value")
+                .map(|value| format!("SET {name} {} KEEPTTL", arg(&value)))
+                .into_iter()
+                .collect(),
+        };
+        command_statement(
+            lines
+                .into_iter()
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
+    fn delete(&self, table: &TableRef, key_columns: &[&str], key: &[Value]) -> EditStatement {
+        let name = command::quote(&table.name);
+        let old = arg(&key.first().map(text).unwrap_or_default());
+        command_statement(match key_columns {
+            ["field"] => format!("HDEL {name} {old}"),
+            // Removing by index would move the items after it, so the item is
+            // marked here and every mark removed once the rest has run.
+            ["index"] => format!("LSET {name} {old} {}", arg(LIST_TOMBSTONE)),
+            ["member"] => format!("{REMOVE_MEMBER} {name} {old}"),
+            _ => format!("DEL {name}"),
+        })
+    }
+}
+
+/// Marks list items to remove; see [`RedisDialect::delete`].
+const LIST_TOMBSTONE: &str = "__sonde_removed__";
+/// Pseudo-commands that [`RedisSession::apply`] turns into real ones once it
+/// knows the key's type: a member may be in a set or a sorted set, and a
+/// renamed field or member keeps its value or score.
+const REMOVE_MEMBER: &str = "SONDE.REMOVE";
+const ADD: &str = "SONDE.ADD";
+const RENAME_FIELD: &str = "SONDE.RENAME-FIELD";
+const RENAME_MEMBER: &str = "SONDE.RENAME-MEMBER";
+
+fn text(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Text(text) => text.to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn arg(text: &str) -> String {
+    command::quote(text)
+}
+
+fn score(text: &str) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        "0".to_owned()
+    } else {
+        arg(text)
+    }
+}
+
+fn command_statement(sql: String) -> EditStatement {
+    EditStatement {
+        sql,
+        params: Vec::new(),
     }
 }
 
@@ -496,6 +622,15 @@ impl Session for RedisSession {
                     )));
                 }
             };
+            // What a row is addressed by when it is edited. Streams and
+            // JSON documents are changed with commands.
+            let primary_key = match kind.as_str() {
+                "string" => vec!["value".to_owned()],
+                "hash" => vec!["field".to_owned()],
+                "list" => vec!["index".to_owned()],
+                "set" | "zset" => vec!["member".to_owned()],
+                _ => Vec::new(),
+            };
             Ok(TableDetail {
                 columns: names
                     .iter()
@@ -506,16 +641,104 @@ impl Session for RedisSession {
                         default: None,
                     })
                     .collect(),
+                primary_key,
                 ..TableDetail::default()
             })
         })
         .await
     }
 
-    async fn apply(&self, _: &[EditStatement]) -> Result<()> {
-        Err(Error::Config(
-            RedisDialect.read_only_reason().unwrap_or_default().into(),
-        ))
+    /// Run the commands staged edits became, in one `MULTI`/`EXEC`.
+    async fn apply(&self, statements: &[EditStatement]) -> Result<()> {
+        let client = self.client.clone();
+        let state = Arc::clone(&self.state);
+        let lines: Vec<String> = statements
+            .iter()
+            .flat_map(|statement| statement.sql.lines().map(str::to_owned).collect::<Vec<_>>())
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        bridge(async move {
+            let mut state = state.lock().await;
+            let mut conn = state.connection(&client).await?;
+            let mut commands: Vec<Vec<String>> = Vec::new();
+            let mut tombstoned: Vec<String> = Vec::new();
+            for line in &lines {
+                let args = split_args(line).map_err(Error::query)?;
+                let Some((name, rest)) = args.split_first() else {
+                    continue;
+                };
+                match (name.as_str(), rest) {
+                    (ADD, [key, pairs @ ..]) => {
+                        let kind: String = redis::cmd("TYPE").arg(key).query_async(&mut conn).await.map_err(|e| command_error(&e))?;
+                        let get = |name: &str| {
+                            pairs
+                                .chunks(2)
+                                .find(|pair| pair[0] == name)
+                                .and_then(|pair| pair.get(1).cloned())
+                                .unwrap_or_default()
+                        };
+                        let score = match get("score").trim() {
+                            "" => "0".to_owned(),
+                            score => score.to_owned(),
+                        };
+                        commands.push(match kind.as_str() {
+                            "hash" => vec!["HSET".into(), key.clone(), get("field"), get("value")],
+                            "list" => vec!["RPUSH".into(), key.clone(), get("value")],
+                            "set" => vec!["SADD".into(), key.clone(), get("member")],
+                            "zset" => vec!["ZADD".into(), key.clone(), score, get("member")],
+                            "string" | "none" => vec!["SET".into(), key.clone(), get("value"), "NX".into()],
+                            other => return Err(Error::query(format!("Sonde cannot add rows to a {other} key; use a command in a query tab."))),
+                        });
+                    }
+                    (REMOVE_MEMBER, [key, member]) => {
+                        let kind: String = redis::cmd("TYPE").arg(key).query_async(&mut conn).await.map_err(|e| command_error(&e))?;
+                        let verb = if kind == "zset" { "ZREM" } else { "SREM" };
+                        commands.push(vec![verb.into(), key.clone(), member.clone()]);
+                    }
+                    (RENAME_FIELD, [key, old, new]) => {
+                        let value: Option<Vec<u8>> = redis::cmd("HGET").arg(key).arg(old).query_async(&mut conn).await.map_err(|e| command_error(&e))?;
+                        let value = value.ok_or(Error::Stale)?;
+                        commands.push(vec!["HDEL".into(), key.clone(), old.clone()]);
+                        commands.push(vec!["HSET".into(), key.clone(), new.clone(), String::from_utf8_lossy(&value).into_owned()]);
+                    }
+                    (RENAME_MEMBER, [key, old, new]) => {
+                        let kind: String = redis::cmd("TYPE").arg(key).query_async(&mut conn).await.map_err(|e| command_error(&e))?;
+                        if kind == "zset" {
+                            let score: Option<String> = redis::cmd("ZSCORE").arg(key).arg(old).query_async(&mut conn).await.map_err(|e| command_error(&e))?;
+                            let score = score.ok_or(Error::Stale)?;
+                            commands.push(vec!["ZREM".into(), key.clone(), old.clone()]);
+                            commands.push(vec!["ZADD".into(), key.clone(), score, new.clone()]);
+                        } else {
+                            commands.push(vec!["SREM".into(), key.clone(), old.clone()]);
+                            commands.push(vec!["SADD".into(), key.clone(), new.clone()]);
+                        }
+                    }
+                    ("LSET", [key, _, value]) if value == LIST_TOMBSTONE => {
+                        if !tombstoned.contains(key) {
+                            tombstoned.push(key.clone());
+                        }
+                        commands.push(args.clone());
+                    }
+                    _ => commands.push(args.clone()),
+                }
+            }
+            for key in tombstoned {
+                commands.push(vec!["LREM".into(), key, "0".into(), LIST_TOMBSTONE.into()]);
+            }
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            for args in &commands {
+                let mut cmd = redis::cmd(&args[0]);
+                for arg in &args[1..] {
+                    cmd.arg(arg);
+                }
+                pipe.add_command(cmd).ignore();
+            }
+            pipe.query_async::<()>(&mut conn)
+                .await
+                .map_err(|error| command_error(&error))
+        })
+        .await
     }
 
     fn dialect(&self) -> &'static dyn Dialect {

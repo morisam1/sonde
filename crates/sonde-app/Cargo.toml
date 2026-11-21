@@ -66,3 +66,9 @@ harness = false
 name = "sqlserver"
 path = "tests/sqlserver.rs"
 harness = false
+
+# Browsing without queries: rules, links, forms, columns, summaries, views.
+[[test]]
+name = "browse"
+path = "tests/browse.rs"
+harness = false

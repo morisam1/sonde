@@ -11,6 +11,7 @@ pub mod edit;
 pub mod elastic;
 pub mod error;
 pub mod export;
+pub mod filter;
 pub mod history;
 pub mod kv;
 pub mod mongo;

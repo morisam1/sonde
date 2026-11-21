@@ -160,7 +160,12 @@ fn table_view_should_read_a_key_in_the_shape_of_its_type() {
         let detail = block_on(session.table_detail(&TableRef::new("db7", key))).unwrap();
         let names: Vec<String> = detail.columns.iter().map(|c| c.name.clone()).collect();
         assert_eq!(names, want);
-        assert!(dialect.read_only_reason().is_some());
+        // Each editable type is keyed on the column that names a row.
+        assert_eq!(
+            detail.primary_key.len(),
+            usize::from(key != "stream"),
+            "{key}"
+        );
 
         let sql = dialect.browse(&TableRef::new("db7", key), &names, filter, None);
         let (rows, _) = run(&*session, &sql, &[]).unwrap();
@@ -216,4 +221,125 @@ fn connect_should_explain_a_closed_port() {
         message.contains("nothing is accepting connections"),
         "{message}"
     );
+}
+
+#[test]
+fn table_edits_should_become_commands_for_each_type() {
+    use sonde_core::edit;
+    let session = fresh(12);
+    setup(
+        &*session,
+        &[
+            "HSET h a 1 b 2",
+            "RPUSH l x y z",
+            "SADD s m1 m2",
+            "ZADD z 1 p 2 q",
+            "SET str old",
+        ],
+    );
+    let dialect = session.dialect();
+    let key = |name: &str| TableRef::unqualified(name);
+    let statements = vec![
+        // Hash: change a value, rename a field, add one, remove one.
+        edit::update(
+            dialect,
+            &key("h"),
+            &["field"],
+            &[text("a")],
+            &["value"],
+            &[text("10")],
+        ),
+        edit::update(
+            dialect,
+            &key("h"),
+            &["field"],
+            &[text("b")],
+            &["field"],
+            &[text("bee")],
+        ),
+        edit::insert(
+            dialect,
+            &key("h"),
+            &["field", "value"],
+            &[text("c"), text("3")],
+        ),
+        // List: remove two items by index, change one, append one.
+        edit::delete(dialect, &key("l"), &["index"], &[Value::Int(0)]),
+        edit::delete(dialect, &key("l"), &["index"], &[Value::Int(2)]),
+        edit::update(
+            dialect,
+            &key("l"),
+            &["index"],
+            &[Value::Int(1)],
+            &["value"],
+            &[text("why")],
+        ),
+        edit::insert(dialect, &key("l"), &["value"], &[text("end")]),
+        // Set: rename and remove members.
+        edit::update(
+            dialect,
+            &key("s"),
+            &["member"],
+            &[text("m1")],
+            &["member"],
+            &[text("one")],
+        ),
+        edit::delete(dialect, &key("s"), &["member"], &[text("m2")]),
+        // Sorted set: rename keeps the score; a new score; a new member.
+        edit::update(
+            dialect,
+            &key("z"),
+            &["member"],
+            &[text("p")],
+            &["member"],
+            &[text("pea")],
+        ),
+        edit::update(
+            dialect,
+            &key("z"),
+            &["member"],
+            &[text("q")],
+            &["score"],
+            &[Value::Float(9.0)],
+        ),
+        edit::insert(dialect, &key("z"), &["member"], &[text("r")]),
+        // String.
+        edit::update(
+            dialect,
+            &key("str"),
+            &["value"],
+            &[text("old")],
+            &["value"],
+            &[text("new")],
+        ),
+    ];
+    block_on(session.apply(&statements)).unwrap();
+
+    let (_, rows) = table(&*session, "HGETALL h").unwrap();
+    let mut pairs: Vec<String> = rows.iter().map(|r| format!("{}={}", r[0], r[1])).collect();
+    pairs.sort();
+    assert_eq!(pairs, ["a=10", "bee=2", "c=3"]);
+    let (_, rows) = table(&*session, "LRANGE l 0 -1").unwrap();
+    let items: Vec<String> = rows.iter().map(|r| r[1].to_string()).collect();
+    assert_eq!(items, ["why", "end"]);
+    let (_, rows) = table(&*session, "SMEMBERS s").unwrap();
+    assert_eq!(rows, [vec![text("one")]]);
+    let (_, rows) = table(&*session, "ZRANGE z 0 -1 WITHSCORES").unwrap();
+    let scored: Vec<String> = rows.iter().map(|r| format!("{}:{}", r[0], r[1])).collect();
+    assert_eq!(scored, ["r:0", "pea:1", "q:9"]);
+    assert_eq!(scalar(&*session, "GET str"), text("new"));
+
+    // A field renamed elsewhere in the meantime writes nothing.
+    let stale = edit::update(
+        dialect,
+        &key("h"),
+        &["field"],
+        &[text("gone")],
+        &["field"],
+        &[text("x")],
+    );
+    assert!(matches!(
+        block_on(session.apply(&[stale])),
+        Err(Error::Stale)
+    ));
 }
