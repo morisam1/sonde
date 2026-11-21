@@ -237,6 +237,17 @@ impl Ui {
         Query(panel)
     }
 
+    /// Replace a field's contents by clicking into it and typing.
+    fn fill(&mut self, id: &'static str, text: &str) {
+        self.with(|window, cx| {
+            window.click(id, cx);
+            window.press("ctrl-a", cx);
+            window.press("backspace", cx);
+            window.input(text, cx);
+        });
+        self.frame();
+    }
+
     /// Put text in the editor and the keyboard focus with it.
     fn write(&mut self, query: &Query, sql: &str) {
         let panel = query.0.clone();
@@ -634,6 +645,87 @@ fn main() -> ExitCode {
     ui.with(|window, cx| Theme::change(ThemeMode::Dark, Some(window), cx));
     ui.shot("q12-dark-error");
     ui.with(|window, cx| Theme::change(ThemeMode::Light, Some(window), cx));
+
+    // ── Tabs, saving and reopening queries ───────────────────────────────
+    let before = ui.queries().len();
+    ui.press("ctrl-t");
+    let tabs = ui.queries();
+    report.check(
+        "tabs: Ctrl+T opens another query tab on the same connection",
+        tabs.len() == before + 1,
+    );
+    let second = Query(tabs.last().unwrap().clone());
+    ui.settle("the new tab's session", {
+        let panel = second.0.clone();
+        move |_, cx| panel.read(cx).is_ready()
+    });
+    ui.write(&second, "select 42 as answer");
+    report.check(
+        "tabs: a tab with new text shows it has unsaved changes",
+        ui.read(&second, |panel, cx| panel.is_dirty(cx)),
+    );
+    ui.shot("q15-tab-bar");
+    ui.press("ctrl-s");
+    report.check(
+        "save: Ctrl+S on a new query asks for its name",
+        ui.has("query-name"),
+    );
+    ui.fill("query-name", "Answer query");
+    ui.click("query-name-save");
+    let file = dir.join("queries").join("Answer query.sql");
+    let saved = ui.settle("the saved query", |window, _| {
+        window.try_find("query-name").is_none()
+    });
+    report.check(
+        "save: the query is written to the queries folder with its connection",
+        saved
+            && std::fs::read_to_string(&file).is_ok_and(|text| {
+                text.starts_with("-- sonde-connection: ") && text.ends_with("select 42 as answer")
+            }),
+    );
+    report.check(
+        "save: the tab takes the name, and the sidebar lists the saved query",
+        ui.read(&second, |panel, cx| {
+            panel.title() == "Answer query" && !panel.is_dirty(cx)
+        }) && ui.with(|window, _| window.try_find("saved-queries").is_some()),
+    );
+    ui.shot("q16-saved-query");
+
+    ui.write(&second, "select 43 as answer");
+    ui.press("ctrl-w");
+    report.check(
+        "close: a tab with unsaved changes asks before closing",
+        ui.has("close-save") && ui.has("close-discard") && ui.queries().len() == before + 1,
+    );
+    ui.shot("q17-unsaved-close");
+    ui.click("close-discard");
+    let closed = ui.settle("the tab to close", move |_, cx| {
+        let _ = cx;
+        true
+    });
+    report.check(
+        "close: Don't save closes the tab and keeps the file as it was",
+        closed
+            && ui.queries().len() == before
+            && std::fs::read_to_string(&file)
+                .is_ok_and(|text| text.ends_with("select 42 as answer")),
+    );
+
+    ui.click_label("Answer query");
+    let reopened =
+        ui.settle("the saved query to open", move |_, _| true) && ui.queries().len() == before + 1;
+    let tab = ui.queries().last().cloned();
+    report.check(
+        "open: clicking a saved query reopens it with its text, unchanged",
+        reopened
+            && tab.is_some_and(|tab| {
+                let tab = Query(tab);
+                ui.read(&tab, |panel, cx| {
+                    panel.text(cx) == "select 42 as answer" && !panel.is_dirty(cx)
+                })
+            }),
+    );
+    ui.press("ctrl-w");
 
     // ── SQLite ───────────────────────────────────────────────────────────
     ui.click_label("Notes");

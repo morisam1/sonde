@@ -12,6 +12,9 @@ pub struct SavedTab {
     pub connection_id: String,
     /// The editor's text.
     pub sql: String,
+    /// The file the query was saved to, if it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
 }
 
 /// The tabs of one session.
@@ -71,10 +74,12 @@ mod tests {
                 SavedTab {
                     connection_id: "a".into(),
                     sql: "select 1;\n-- \"quoted\" 'text'\nselect 2".into(),
+                    path: Some("/queries/Report.sql".into()),
                 },
                 SavedTab {
                     connection_id: "b".into(),
                     sql: String::new(),
+                    path: None,
                 },
             ],
             active: Some(1),

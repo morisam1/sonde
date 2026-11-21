@@ -4,12 +4,15 @@
 //! the open item.
 
 mod preferences;
+mod queries;
 
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, TitleBar,
     breadcrumb::{Breadcrumb, BreadcrumbItem},
     button::{Button, ButtonVariants as _},
-    h_flex, v_flex, window_corner_radii,
+    h_flex,
+    menu::ContextMenuExt as _,
+    v_flex, window_corner_radii,
 };
 use gpui_kit::{prelude::FluentBuilder as _, *};
 
@@ -34,6 +37,18 @@ actions!(
         ToggleSidebar,
         /// Close the open tab.
         CloseTab,
+        /// Open a new query tab on the current connection.
+        NewQuery,
+        /// Save the open query.
+        SaveQuery,
+        /// Save the open query under a new name.
+        SaveQueryAs,
+        /// Open `.sql` files from disk.
+        OpenQueryFile,
+        /// Show the next tab.
+        NextTab,
+        /// Show the previous tab.
+        PreviousTab,
     ]
 );
 
@@ -45,6 +60,14 @@ pub(crate) fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-b", ToggleSidebar, Some(CONTEXT)),
         KeyBinding::new("ctrl-w", CloseTab, Some(CONTEXT)),
+        KeyBinding::new("ctrl-t", NewQuery, Some(CONTEXT)),
+        KeyBinding::new("ctrl-s", SaveQuery, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-s", SaveQueryAs, Some(CONTEXT)),
+        KeyBinding::new("ctrl-o", OpenQueryFile, Some(CONTEXT)),
+        KeyBinding::new("ctrl-pagedown", NextTab, Some(CONTEXT)),
+        KeyBinding::new("ctrl-pageup", PreviousTab, Some(CONTEXT)),
+        KeyBinding::new("ctrl-tab", NextTab, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-tab", PreviousTab, Some(CONTEXT)),
     ]);
 }
 
@@ -120,6 +143,9 @@ pub struct Workspace {
     setup: Option<Entity<SetupWizard>>,
     _setup_events: Option<Subscription>,
     tabs: Vec<Tab>,
+    /// Where saved queries go, and what is there.
+    queries_dir: std::path::PathBuf,
+    saved_queries: Vec<crate::saved_queries::SavedQuery>,
     /// The tab on screen; `None` shows the overview.
     active: Option<usize>,
     queries_opened: usize,
@@ -241,6 +267,8 @@ impl Workspace {
             setup,
             _setup_events: setup_events,
             tabs: Vec::new(),
+            saved_queries: crate::saved_queries::list(&dir.join("queries")),
+            queries_dir: dir.join("queries"),
             active: None,
             queries_opened: 0,
             seen_selection: None,
@@ -306,6 +334,7 @@ impl Workspace {
                 tabs.push(SavedTab {
                     connection_id: panel.connection_id().to_owned(),
                     sql: panel.text(cx),
+                    path: panel.path().map(std::path::Path::to_path_buf),
                 });
             }
         }
@@ -323,28 +352,20 @@ impl Workspace {
         let saved = self.session_file.load();
         let mut opened = Vec::new();
         for (ix, tab) in saved.tabs.iter().enumerate() {
-            // A tab on a listed database reopens on that database.
-            let parent = crate::connections::keyring_id(&tab.connection_id);
-            let Some(connection) = self.connections.read(cx).get(parent).cloned() else {
+            let Some(target) = self.target_for(&tab.connection_id, cx) else {
                 continue;
-            };
-            let target = match crate::connections::database_of(&tab.connection_id) {
-                Some(database) => QueryTarget {
-                    id: tab.connection_id.clone(),
-                    name: format!("{} · {database}", connection.name),
-                    config: connection.config.with_database(database),
-                    password: None,
-                },
-                None => QueryTarget {
-                    id: connection.id,
-                    name: connection.name,
-                    config: connection.config,
-                    password: None,
-                },
             };
             self.open_query(target, window, cx);
             if let Some(TabKind::Query(panel)) = self.tabs.last().map(|tab| tab.kind.clone()) {
-                panel.update(cx, |panel, cx| panel.set_text(&tab.sql, window, cx));
+                panel.update(cx, |panel, cx| {
+                    panel.set_text(&tab.sql, window, cx);
+                    // A tab on a file compares with what the file holds now.
+                    if let Some(path) = &tab.path
+                        && let Ok(file) = crate::saved_queries::read(path)
+                    {
+                        panel.mark_saved(path.clone(), file.sql, cx);
+                    }
+                });
             }
             opened.push((ix, self.tabs.len() - 1));
         }
@@ -413,6 +434,19 @@ impl Workspace {
                 TabKind::Table(_) => None,
             })
             .collect()
+    }
+
+    /// Step through the tabs, wrapping at either end.
+    fn cycle_tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.tabs.len() as isize;
+        if count == 0 {
+            return;
+        }
+        let from = self
+            .active
+            .map_or(if step > 0 { -1 } else { 0 }, |ix| ix as isize);
+        let next = (from + step).rem_euclid(count) as usize;
+        self.activate(Some(next), window, cx);
     }
 
     fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -488,6 +522,7 @@ impl Render for Workspace {
                 .rounded_bl(radii.bottom_left)
         });
 
+        let short = window.viewport_size().height < px(640.);
         let content: AnyElement = match self.active.and_then(|ix| self.tabs.get(ix)) {
             Some(tab) => tab.kind.view().into_any_element(),
             None => self.render_overview(window, cx),
@@ -505,10 +540,26 @@ impl Render for Workspace {
                     .rounded_bl(radii.bottom_left)
             })
             .child(
-                self.render_header(sidebar_open, cx)
+                self.render_header(sidebar_open, short, cx)
                     .when(sidebar_open, |bar| bar.rounded_tl(px(0.))),
             )
-            .child(div().flex_1().min_h_0().p_6().child(content));
+            .when(!self.tabs.is_empty(), |this| {
+                this.child(self.render_tab_bar(short, cx))
+            })
+            // A short window gives the content more of its height.
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .map(|this| {
+                        if short {
+                            this.px_6().py_2()
+                        } else {
+                            this.p_6()
+                        }
+                    })
+                    .child(content),
+            );
 
         h_flex()
             .key_context(CONTEXT)
@@ -518,9 +569,27 @@ impl Render for Workspace {
             )
             .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
                 if let Some(ix) = this.active {
-                    this.close_tab(ix, window, cx);
+                    this.request_close(ix, window, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &NewQuery, window, cx| this.new_query(window, cx)))
+            .on_action(cx.listener(|this, _: &SaveQuery, window, cx| {
+                if let Some(ix) = this.active {
+                    this.save_query(ix, false, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SaveQueryAs, window, cx| {
+                if let Some(ix) = this.active {
+                    this.save_query(ix, true, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &OpenQueryFile, window, cx| {
+                this.choose_query_files(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NextTab, window, cx| this.cycle_tab(1, window, cx)))
+            .on_action(
+                cx.listener(|this, _: &PreviousTab, window, cx| this.cycle_tab(-1, window, cx)),
+            )
             .size_full()
             .text_color(foreground)
             .font_family(crate::design::UI_FONT)
@@ -576,76 +645,57 @@ impl Workspace {
                     cx,
                 );
             }));
-        // Open tabs scroll after about five, so the tree keeps its room.
-        let mut items = v_flex().gap_1();
-        for (ix, tab) in self.tabs.iter().enumerate() {
-            let active = self.active == Some(ix);
-            let (glyph, badge, staged) = match &tab.kind {
-                TabKind::Query(panel) => (
-                    Glyph::SquareTerminal,
-                    if panel.read(cx).is_running() {
-                        "…".to_owned()
-                    } else {
-                        "SQL".to_owned()
-                    },
-                    false,
-                ),
-                TabKind::Table(panel) => {
-                    let staged = panel.read(cx).staged(cx);
-                    (
-                        Glyph::Table,
-                        if staged > 0 {
-                            format!("+{staged}")
-                        } else {
-                            String::new()
-                        },
-                        staged > 0,
-                    )
-                }
-            };
-            let group: SharedString = format!("open-tab-{ix}").into();
-            items = items.child(
-                ui::menu_button(("open-tab", ix), active, cx)
-                    .group(group.clone())
-                    .child(ui::icon(glyph).flex_shrink_0())
+        // Saved queries scroll after about five, so the tree keeps its room.
+        let mut saved = v_flex().gap_1();
+        for (ix, query) in self.saved_queries.iter().enumerate() {
+            let open = self.active.and_then(|active| self.tabs.get(active)).is_some_and(|tab| {
+                matches!(&tab.kind, TabKind::Query(panel) if panel.read(cx).path() == Some(query.path.as_path()))
+            });
+            let (path, menu_path) = (query.path.clone(), query.path.clone());
+            let owner = cx.weak_entity();
+            saved = saved.child(
+                ui::menu_button(("saved-query", ix), open, cx)
+                    .test_support()
+                    .aria_label(query.name.clone())
+                    .child(ui::icon(Glyph::FileCode).flex_shrink_0())
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .child(tab.kind.title(cx)),
+                            .child(query.name.clone()),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .group_hover(group.clone(), |this| this.invisible())
-                            .child(ui::menu_badge(badge, cx).when(staged, |this| {
-                                this.text_color(crate::design::tokens(cx).staged)
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id(("close-tab", ix))
-                            .absolute()
-                            .right_1p5()
-                            .size_7()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.))
-                            .invisible()
-                            .group_hover(group, |this| this.visible())
-                            .hover(|this| this.bg(border))
-                            .child(ui::icon(Glyph::X).with_size(px(16.)))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.close_tab(ix, window, cx);
-                            })),
-                    )
-                    .relative()
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.activate(Some(ix), window, cx)),
-                    ),
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_query_file(&path, window, cx);
+                    }))
+                    .context_menu(move |menu, _, _| {
+                        let (open, rename, delete) =
+                            (menu_path.clone(), menu_path.clone(), menu_path.clone());
+                        let (o1, o2, o3) = (owner.clone(), owner.clone(), owner.clone());
+                        menu.min_w(px(ui::MENU_WIDTH))
+                            .item(ui::menu_item("Open", Glyph::FileCode, false).on_click(
+                                move |_, window, cx| {
+                                    let _ = o1.update(cx, |this, cx| {
+                                        this.open_query_file(&open, window, cx)
+                                    });
+                                },
+                            ))
+                            .item(ui::menu_item("Rename…", Glyph::PencilLine, false).on_click(
+                                move |_, window, cx| {
+                                    let _ = o2.update(cx, |this, cx| {
+                                        this.rename_saved_query(rename.clone(), window, cx);
+                                    });
+                                },
+                            ))
+                            .separator()
+                            .item(ui::menu_item("Delete…", Glyph::Trash, true).on_click(
+                                move |_, window, cx| {
+                                    let _ = o3.update(cx, |this, cx| {
+                                        this.delete_saved_query(delete.clone(), window, cx);
+                                    });
+                                },
+                            ))
+                    }),
             );
         }
 
@@ -656,14 +706,27 @@ impl Workspace {
             .gap_1()
             .child(ui::group_label("Workspace", cx))
             .child(new_connection)
-            .when(!self.tabs.is_empty(), |this| {
-                this.child(
-                    div()
-                        .id("open-tabs")
-                        .max_h(px(crate::design::ROW_HEIGHT * 5. + 16.))
-                        .overflow_y_scroll()
-                        .child(items),
-                )
+            .child(
+                ui::menu_button("open-query-file", false, cx)
+                    .test_support()
+                    .role(Role::Button)
+                    .aria_label("Open query file")
+                    .child(ui::icon(Glyph::FolderOpen))
+                    .child(div().flex_1().truncate().child("Open query file…"))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.choose_query_files(window, cx)),
+                    ),
+            )
+            .when(!self.saved_queries.is_empty(), |this| {
+                this.child(div().pt_2().child(ui::group_label("Saved queries", cx)))
+                    .child(
+                        div()
+                            .id("saved-queries")
+                            .test_support()
+                            .max_h(px(crate::design::ROW_HEIGHT * 5. + 16.))
+                            .overflow_y_scroll()
+                            .child(saved),
+                    )
             });
 
         let connections_group = v_flex()
@@ -685,8 +748,210 @@ impl Workspace {
             .child(connections_group)
     }
 
+    /// The open tabs, as an editor shows them: each with its icon, title, and
+    /// a dot for unsaved changes that turns into a close button on hover.
+    fn render_tab_bar(&self, short: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = cx.theme();
+        let (border, quiet, foreground, background, accent) = (
+            theme.border,
+            theme.muted_foreground,
+            theme.foreground,
+            theme.background,
+            theme.primary,
+        );
+        let strip = crate::design::tokens(cx).well;
+        let hover = theme.secondary_hover;
+        let mut tabs = h_flex().h_full();
+        for (ix, tab) in self.tabs.iter().enumerate() {
+            let active = self.active == Some(ix);
+            let (glyph, dirty, running) = match &tab.kind {
+                TabKind::Query(panel) => {
+                    let panel = panel.read(cx);
+                    (
+                        Glyph::SquareTerminal,
+                        panel.is_dirty(cx),
+                        panel.is_running(),
+                    )
+                }
+                TabKind::Table(panel) => (Glyph::Table, panel.read(cx).staged(cx) > 0, false),
+            };
+            let title = tab.kind.title(cx);
+            let group: SharedString = format!("tab-{ix}").into();
+            let owner = cx.weak_entity();
+            let is_query = matches!(tab.kind, TabKind::Query(_));
+            let trailing = div()
+                .id(("tab-close", ix))
+                .test_support()
+                .aria_label(format!("Close {title}"))
+                .size_5()
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.))
+                .hover(|this| this.bg(hover))
+                .map(|this| {
+                    if dirty {
+                        // The dot gives way to the close button on hover.
+                        this.child(
+                            div()
+                                .size(px(8.))
+                                .rounded_full()
+                                .bg(foreground)
+                                .group_hover(group.clone(), |this| this.invisible()),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .invisible()
+                                .group_hover(group.clone(), |this| this.visible())
+                                .child(ui::icon(Glyph::X).with_size(px(14.))),
+                        )
+                    } else {
+                        this.child(
+                            div()
+                                .when(!active, |this| this.invisible())
+                                .group_hover(group.clone(), |this| this.visible())
+                                .child(ui::icon(Glyph::X).with_size(px(14.))),
+                        )
+                    }
+                })
+                .relative()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.request_close(ix, window, cx);
+                }));
+            tabs = tabs.child(
+                h_flex()
+                    .id(("tab", ix))
+                    .test_support()
+                    .aria_label(format!("{title} tab"))
+                    .group(group.clone())
+                    .h_full()
+                    .flex_shrink_0()
+                    .max_w(px(240.))
+                    .pl_3()
+                    .pr_1p5()
+                    .gap_2()
+                    .items_center()
+                    .border_r_1()
+                    .border_color(border)
+                    .text_sm()
+                    .cursor_pointer()
+                    .when(active, |this| {
+                        this.bg(background)
+                            .text_color(foreground)
+                            .border_t_2()
+                            .border_color(accent)
+                    })
+                    .when(!active, |this| {
+                        this.text_color(quiet)
+                            .border_t_2()
+                            .border_color(strip)
+                            .hover(|this| this.bg(hover))
+                    })
+                    .child(ui::icon(glyph).with_size(px(14.)).flex_shrink_0())
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .when(running, |this| this.italic())
+                            .child(title),
+                    )
+                    .child(trailing)
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.activate(Some(ix), window, cx)),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(move |this, _, window, cx| this.request_close(ix, window, cx)),
+                    )
+                    .context_menu(move |menu, _, _| {
+                        let menu = menu.min_w(px(ui::MENU_WIDTH));
+                        let (o1, o2, o3, o4) =
+                            (owner.clone(), owner.clone(), owner.clone(), owner.clone());
+                        let menu = if is_query {
+                            menu.item(ui::menu_item("Save", Glyph::Save, false).on_click(
+                                move |_, window, cx| {
+                                    let _ = o1.update(cx, |this, cx| {
+                                        this.save_query(ix, false, window, cx)
+                                    });
+                                },
+                            ))
+                            .item(ui::menu_item("Save as…", Glyph::Save, false).on_click(
+                                move |_, window, cx| {
+                                    let _ = o2.update(cx, |this, cx| {
+                                        this.save_query(ix, true, window, cx)
+                                    });
+                                },
+                            ))
+                            .separator()
+                        } else {
+                            menu
+                        };
+                        menu.item(ui::menu_item("Close", Glyph::X, false).on_click(
+                            move |_, window, cx| {
+                                let _ =
+                                    o3.update(cx, |this, cx| this.request_close(ix, window, cx));
+                            },
+                        ))
+                        .item(
+                            ui::menu_item("Close others", Glyph::X, false).on_click(
+                                move |_, window, cx| {
+                                    let _ =
+                                        o4.update(cx, |this, cx| this.close_others(ix, window, cx));
+                                },
+                            ),
+                        )
+                    }),
+            );
+        }
+        let new_tab = div()
+            .id("new-query-tab")
+            .test_support()
+            .aria_label("New query tab")
+            .h_full()
+            .px_3()
+            .flex()
+            .items_center()
+            .text_color(quiet)
+            .cursor_pointer()
+            .hover(|this| this.bg(hover).text_color(foreground))
+            .child(ui::icon(Glyph::Plus).with_size(px(16.)))
+            .on_click(cx.listener(|this, _, window, cx| this.new_query(window, cx)));
+
+        div()
+            .id("tab-bar")
+            .flex_shrink_0()
+            .h(px(if short { 32. } else { 40. }))
+            .bg(strip)
+            .border_b_1()
+            .border_color(border)
+            .overflow_x_scroll()
+            .child(h_flex().h_full().child(tabs).child(new_tab))
+    }
+
+    /// Close every tab but one, asking about unsaved queries one by one.
+    fn close_others(&mut self, keep: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // From the right, so the indexes still to visit do not move.
+        for ix in (0..self.tabs.len()).rev() {
+            if ix == keep {
+                continue;
+            }
+            let dirty =
+                matches!(&self.tabs[ix].kind, TabKind::Query(panel) if panel.read(cx).is_dirty(cx));
+            if dirty {
+                // The question opens for the first unsaved tab; the user
+                // closes the rest after answering it.
+                self.request_close(ix, window, cx);
+                return;
+            }
+            self.close_tab(ix, window, cx);
+        }
+    }
+
     /// `header`: h-14, the sidebar trigger, a separator, the breadcrumb.
-    fn render_header(&self, sidebar_open: bool, cx: &mut Context<Self>) -> TitleBar {
+    fn render_header(&self, sidebar_open: bool, short: bool, cx: &mut Context<Self>) -> TitleBar {
         let crumbs = self.crumbs(cx);
         let last = crumbs.len().saturating_sub(1);
         let owner = cx.weak_entity();
@@ -717,7 +982,7 @@ impl Workspace {
             .on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx)));
 
         TitleBar::new()
-            .h(px(48.))
+            .h(px(if short { 40. } else { 48. }))
             .pl_4()
             .bg(cx.theme().background)
             .child(

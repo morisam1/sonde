@@ -552,6 +552,11 @@ impl TableView {
     }
 
     /// The connection and table this tab shows.
+    /// Where the tab connects.
+    pub fn target(&self) -> QueryTarget {
+        self.target.clone()
+    }
+
     pub fn shows(&self, connection: &str, table: &TableRef) -> bool {
         self.target.id == connection && &self.table_ref == table
     }

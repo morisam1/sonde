@@ -16,7 +16,7 @@ gpui_kit::assets::icon_assets!(
     [
         Database, Layers, Table, Eye, Columns3, KeyRound, Key, Link, Plug, Unplug, ListTree,
         Hash, Rows3, X, Moon, Sun, Monitor, SquareTerminal, DatabasePlus, FolderPlus, Plus,
-        PencilLine, Eraser, Trash, SquarePen
+        PencilLine, Eraser, Trash, SquarePen, FileCode, Save, FolderOpen
     ]
 );
 

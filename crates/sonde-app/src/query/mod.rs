@@ -13,7 +13,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     highlighter::{Diagnostic, DiagnosticSeverity},
-    input::{Editor, EditorState, ShowCompletions},
+    input::{Editor, EditorState, InputEvent, ShowCompletions},
     menu::{DropdownMenu as _, PopupMenuItem},
     resizable::{resizable_panel, v_resizable},
     tab::{Tab, TabBar},
@@ -168,6 +168,11 @@ struct Problem {
 
 pub struct QueryPanel {
     title: SharedString,
+    /// The file the query was opened from or saved to.
+    path: Option<std::path::PathBuf>,
+    /// The text as it is in that file, to tell unsaved changes.
+    saved_text: Option<String>,
+    _editor_changes: Subscription,
     target: QueryTarget,
     secrets: Option<Arc<dyn SecretStore>>,
     editor: Entity<EditorState>,
@@ -200,8 +205,17 @@ impl QueryPanel {
         editor.update(cx, |editor, _| {
             editor.lsp_mut().completion_provider = Some(provider);
         });
+        // Every edit may change whether the tab has unsaved changes.
+        let editor_changes = cx.subscribe(&editor, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
         let mut this = Self {
             title,
+            path: None,
+            saved_text: None,
+            _editor_changes: editor_changes,
             target,
             secrets: secrets.clone(),
             editor,
@@ -721,9 +735,49 @@ impl Focusable for QueryPanel {
 }
 
 impl QueryPanel {
-    /// The tab's title, "Query 1" and so on.
+    /// The tab's title: the file's name once it has one, else "Query 1" and
+    /// so on.
     pub fn title(&self) -> SharedString {
-        self.title.clone()
+        match &self.path {
+            Some(path) => crate::saved_queries::name_of(path).into(),
+            None => self.title.clone(),
+        }
+    }
+
+    /// The file the query was opened from or saved to.
+    pub fn path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
+    }
+
+    /// Record that the editor's text is now what `path` holds.
+    pub fn mark_saved(&mut self, path: std::path::PathBuf, text: String, cx: &mut Context<Self>) {
+        self.path = Some(path);
+        self.saved_text = Some(text);
+        cx.notify();
+    }
+
+    /// Point the tab at another file (after a rename), or at none (after
+    /// the file was deleted, which leaves the text unsaved).
+    pub fn set_path(&mut self, path: Option<std::path::PathBuf>, cx: &mut Context<Self>) {
+        if path.is_none() {
+            self.saved_text = None;
+        }
+        self.path = path;
+        cx.notify();
+    }
+
+    /// Whether the text differs from the file, or is new and not empty.
+    pub fn is_dirty(&self, cx: &App) -> bool {
+        let text = self.text(cx);
+        match &self.saved_text {
+            Some(saved) => *saved != text,
+            None => !text.trim().is_empty(),
+        }
+    }
+
+    /// Where the tab connects, for opening another tab on the same place.
+    pub fn target(&self) -> QueryTarget {
+        self.target.clone()
     }
 
     /// The saved connection's name.

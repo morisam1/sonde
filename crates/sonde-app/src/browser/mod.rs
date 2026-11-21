@@ -938,8 +938,15 @@ impl BrowserPanel {
 
     /// Ask the workspace for a query tab on a connected connection.
     fn open_query(&mut self, connection: &str, cx: &mut Context<Self>) {
-        let target = self
-            .entries
+        if let Some(target) = self.query_target(connection) {
+            cx.emit(BrowserEvent::OpenQuery(target));
+        }
+    }
+
+    /// Where a tab on a connected connection connects, with the password
+    /// typed for it this session.
+    pub(crate) fn query_target(&self, connection: &str) -> Option<QueryTarget> {
+        self.entries
             .iter()
             .find(|entry| entry.saved.id == connection)
             .filter(|entry| matches!(entry.status, Status::Connected { .. }))
@@ -948,10 +955,12 @@ impl BrowserPanel {
                 name: self.tab_name(entry),
                 config: entry.saved.config.clone(),
                 password: entry.password.clone(),
-            });
-        if let Some(target) = target {
-            cx.emit(BrowserEvent::OpenQuery(target));
-        }
+            })
+    }
+
+    /// The connection of the selected row, when it is connected.
+    pub(crate) fn selected_target(&self, cx: &App) -> Option<QueryTarget> {
+        self.query_target(&self.selected_connection(cx)?)
     }
 
     /// Ask the workspace for a tab with a table's rows.

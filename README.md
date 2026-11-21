@@ -59,6 +59,8 @@ Each database takes its own language in the query tab:
 - **Saved connections.** Pick the engine, fill in the details, test, save. Or paste a URL such as `postgres://…`, `mysql://…`, `mongodb+srv://…` or `redis://…`.
 - **Schema browser.** Schemas, tables, views, columns, keys and indexes in the sidebar. You can show one database or every database on the server.
 - **Query editor.** Syntax colors, and completion for keywords, tables, columns, Redis commands and MongoDB collections.
+- **Tabs.** Every query and table opens in its own tab, like in a code editor. A dot marks a query with unsaved changes.
+- **Saved queries.** Save a query with `Ctrl+S` and it appears under **Saved queries** in the sidebar, ready to reopen on its connection. You can also open a `.sql` file from anywhere on disk; `Ctrl+S` then saves it back in place.
 - **Big results.** Rows arrive in pages, so huge results never freeze the app. You can cancel a slow query at any time.
 - **Safe editing.** Change cells, add and delete rows, then review the statements before anything is written. If a row changed since you loaded it, nothing is written.
 - **Manage structure.** Right-click to create, rename, empty or drop databases, schemas, tables, collections, indexes, columns and keys.
@@ -152,8 +154,14 @@ A check asks GitHub for the list of Sonde releases. It sends nothing about you o
 | `Ctrl+Enter` | Run the statement under the cursor, or the selection |
 | `Ctrl+Shift+Enter` | Run the whole script |
 | `Ctrl+Space` | Show completions |
+| `Ctrl+T` | New query tab on the current connection |
+| `Ctrl+S` | Save the query |
+| `Ctrl+Shift+S` | Save the query under a new name |
+| `Ctrl+O` | Open a `.sql` file |
+| `Ctrl+W` | Close the tab (asks first if the query has unsaved changes) |
+| `Ctrl+Tab`, `Ctrl+Page Down` | Next tab |
+| `Ctrl+Shift+Tab`, `Ctrl+Page Up` | Previous tab |
 | `Ctrl+B` | Show or hide the sidebar |
-| `Ctrl+W` | Close the tab |
 | `Enter` | Edit the selected cell (in a table) |
 | `Delete` | Mark the selected row for deletion (in a table) |
 | `Ctrl+C` | Copy the selected cells |
@@ -170,6 +178,7 @@ Sonde keeps its files in one folder:
 
 - `connections.toml` holds your saved connections. Passwords are never stored there; they go in the system keyring.
 - `settings.toml` sets the editor font and size, the page size and the row limit. Sonde writes a commented copy the first time it starts.
+- `queries/` holds your saved queries, as `.sql` files. The first line of each names the connection it runs on.
 - `updates.toml` holds your update choice and channel.
 - `layout.toml` holds the window size, the theme and the sidebar width.
 
